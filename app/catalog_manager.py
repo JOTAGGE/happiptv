@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import difflib
 import re
 import unicodedata
 from collections import defaultdict
@@ -18,20 +19,46 @@ def normalize_text(text: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c)).casefold().strip()
 
 
-def matches_query(query: str, target: str) -> bool:
+def search_score(query: str, target: str) -> float:
+    """Return a relevance score without letting fuzzy matching flood the results."""
     norm_q = normalize_text(query)
     if not norm_q:
-        return True
+        return 1.0
     norm_t = normalize_text(target)
     if not norm_t:
-        return False
+        return 0.0
+    if norm_q == norm_t:
+        return 1000.0
+    if norm_t.startswith(norm_q):
+        return 850.0 - min(len(norm_t) - len(norm_q), 100)
     if norm_q in norm_t:
-        return True
-    # Split query into words and check if all exist in target
-    q_words = norm_q.split()
-    if len(q_words) > 1 and all(qw in norm_t for qw in q_words):
-        return True
-    return False
+        return 700.0 - norm_t.index(norm_q)
+
+    query_tokens = re.findall(r"[\w']+", norm_q)
+    target_tokens = re.findall(r"[\w']+", norm_t)
+    if not query_tokens or not target_tokens:
+        return 0.0
+
+    token_scores: list[float] = []
+    for query_token in query_tokens:
+        best = 0.0
+        for target_token in target_tokens:
+            if query_token == target_token:
+                best = 1.0
+            elif target_token.startswith(query_token) or query_token.startswith(target_token):
+                best = max(best, 0.9)
+            elif len(query_token) >= 4 and len(target_token) >= 4:
+                ratio = difflib.SequenceMatcher(None, query_token, target_token).ratio()
+                if ratio >= 0.78:
+                    best = max(best, ratio)
+        if best == 0.0:
+            return 0.0
+        token_scores.append(best)
+    return 500.0 * (sum(token_scores) / len(token_scores))
+
+
+def matches_query(query: str, target: str) -> bool:
+    return search_score(query, target) > 0
 
 
 class CatalogManager:
@@ -61,8 +88,15 @@ class CatalogManager:
     def save_cache(self) -> None:
         try:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cached_items = []
+            for item in self.items.values():
+                raw = item.to_dict()
+                # Stream URLs may contain Xtream credentials or signed M3U tokens.
+                # They are reconstructed after account sync and never persisted here.
+                raw["stream_url"] = ""
+                cached_items.append(raw)
             data = {
-                "items": [item.to_dict() for item in self.items.values()]
+                "items": cached_items
             }
             temp = self.cache_file.with_suffix(".tmp")
             temp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -94,7 +128,7 @@ class CatalogManager:
         hidden_set = {normalize_text(c) for c in (hidden_categories or [])}
         locked_set = {normalize_text(c) for c in (locked_categories or [])}
 
-        results: list[MediaItem] = []
+        ranked_results: list[tuple[float, MediaItem]] = []
         for item in self.items.values():
             if kind and item.kind != kind:
                 continue
@@ -117,12 +151,19 @@ class CatalogManager:
                 continue
 
             # Search query filter
-            if query and not (matches_query(query, item.title) or matches_query(query, item.category_name)):
-                continue
+            relevance = 1.0
+            if query:
+                title_score = search_score(query, item.title)
+                category_score = search_score(query, item.category_name) * 0.45
+                relevance = max(title_score, category_score)
+                if relevance <= 0:
+                    continue
 
-            results.append(item)
+            ranked_results.append((relevance, item))
 
-        return results
+        if query:
+            ranked_results.sort(key=lambda pair: (-pair[0], normalize_text(pair[1].title)))
+        return [item for _, item in ranked_results]
 
     def get_categories(self, kind: str, hidden_categories: list[str] | None = None) -> list[str]:
         hidden_set = {normalize_text(c) for c in (hidden_categories or [])}

@@ -81,6 +81,20 @@ def test_catalog_smart_refresh_preserves_user_data(tmp_path: Path) -> None:
     assert user_progress["item-1"]["position_ms"] == 3600000
 
 
+def test_catalog_cache_never_persists_authenticated_stream_url(tmp_path: Path) -> None:
+    cache_file = tmp_path / "catalog_cache.json"
+    catalog = CatalogManager(cache_file=cache_file)
+    catalog.add_items([
+        MediaItem(
+            id="secure-1", kind="movie", title="Filme", stream_id=1,
+            stream_url="https://server/movie/user/very-secret/1.mp4",
+        )
+    ])
+    cache_text = cache_file.read_text(encoding="utf-8")
+    assert "very-secret" not in cache_text
+    assert json.loads(cache_text)["items"][0]["stream_url"] == ""
+
+
 def test_catalog_hides_categories_and_searches(tmp_path: Path) -> None:
     cache_file = tmp_path / "catalog_cache.json"
     catalog = CatalogManager(cache_file=cache_file)
@@ -104,7 +118,7 @@ def test_catalog_hides_categories_and_searches(tmp_path: Path) -> None:
 
 def test_download_manager_offline_library_and_deletion(tmp_path: Path) -> None:
     history_file = tmp_path / "history.json"
-    dm = DownloadManager(history_path=history_file)
+    dm = DownloadManager(history_path=history_file, download_root=tmp_path)
 
     # Fake a completed task with an actual file on disk
     download_file = tmp_path / "offline_movie.mp4"
@@ -145,13 +159,13 @@ def test_config_export_and_import_backup(tmp_path: Path) -> None:
     # Export without passwords
     exported = store.export_backup(config, include_passwords=False)
     data = json.loads(exported)
-    assert data["parental_pin"] == "4321"
+    assert data["parental_pin"] == ""
     assert data["accounts"][0]["password"] == ""
 
     # Import backup into fresh store
     new_store = ConfigStore(path=tmp_path / "new_config.json")
     imported_config = new_store.import_backup(exported)
-    assert imported_config.parental_pin == "4321"
+    assert imported_config.parental_pin == ""
     assert imported_config.accounts[0]["username"] == "user1"
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QLabel, QLineEdit, QMessageBox,
@@ -8,9 +10,10 @@ from PySide6.QtWidgets import (
 
 
 class PinDialog(QDialog):
-    def __init__(self, expected_pin: str = "0000", title: str = "Controle Parental", parent: QWidget | None = None) -> None:
+    def __init__(self, expected_pin: str = "0000", title: str = "Controle Parental", parent: QWidget | None = None, verifier: Callable[[str], bool] | None = None) -> None:
         super().__init__(parent)
         self.expected_pin = expected_pin
+        self.verifier = verifier
         self.setWindowTitle(title)
         self.setFixedSize(320, 180)
         self.setStyleSheet("background-color: #0d1118; color: #fff;")
@@ -41,7 +44,8 @@ class PinDialog(QDialog):
         layout.addWidget(buttons)
 
     def _check_pin(self) -> None:
-        if self.pin_input.text() == self.expected_pin:
+        valid = self.verifier(self.pin_input.text()) if self.verifier else self.pin_input.text() == self.expected_pin
+        if valid:
             self.accept()
         else:
             QMessageBox.warning(self, "PIN Incorreto", "O código PIN informado está incorreto.")
