@@ -26,11 +26,14 @@ def decode_epg_title(raw_title: str) -> str:
 
 
 class EPGWidget(QWidget):
-    channel_selected = Signal(object)           # MediaItem
+    channel_selected = Signal(object)           # MediaItem to play
+    channel_highlighted = Signal(object)        # MediaItem to preview EPG
     channel_favorited = Signal(str)             # channel_id
+    add_to_playlist_requested = Signal(object)  # MediaItem
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.selected_channel: MediaItem | None = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -42,7 +45,7 @@ class EPGWidget(QWidget):
 
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 Filtrar canais ao vivo...")
+        self.search_input.setPlaceholderText("🔍 Filtrar canais ao vivo (digite sem trocar de tela)...")
         self.search_input.textChanged.connect(self._filter_channels)
         search_row.addWidget(self.search_input)
 
@@ -53,7 +56,9 @@ class EPGWidget(QWidget):
         channels_col.addLayout(search_row)
 
         self.channels_list = QListWidget()
-        self.channels_list.currentItemChanged.connect(self._on_channel_selected)
+        self.channels_list.itemClicked.connect(self._on_item_clicked)
+        self.channels_list.itemDoubleClicked.connect(self._on_item_activated)
+        self.channels_list.itemActivated.connect(self._on_item_activated)
         channels_col.addWidget(self.channels_list, 1)
 
         layout.addLayout(channels_col, 1)
@@ -77,7 +82,7 @@ class EPGWidget(QWidget):
         # "Agora no ar" card
         self.now_playing_title = QLabel("Programa atual: —")
         self.now_playing_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #00e054;")
-        self.now_playing_desc = QLabel("Descrição do programa atual...")
+        self.now_playing_desc = QLabel("Selecione um canal na lista para ver a programação sem interromper sua navegação.")
         self.now_playing_desc.setWordWrap(True)
         self.now_playing_desc.setStyleSheet("font-size: 12px; color: #9aa7bc;")
         self.now_playing_time = QLabel("00:00 — 00:00")
@@ -86,6 +91,24 @@ class EPGWidget(QWidget):
         header_layout.addWidget(self.now_playing_title)
         header_layout.addWidget(self.now_playing_time)
         header_layout.addWidget(self.now_playing_desc)
+
+        # Action buttons row (Play channel, Add to playlist)
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
+
+        self.btn_play_channel = QPushButton("▶ Assistir Canal")
+        self.btn_play_channel.setProperty("primary", True)
+        self.btn_play_channel.clicked.connect(self._play_current_channel)
+        self.btn_play_channel.setEnabled(False)
+
+        self.btn_add_playlist = QPushButton("+ Playlist")
+        self.btn_add_playlist.clicked.connect(self._add_current_to_playlist)
+        self.btn_add_playlist.setEnabled(False)
+
+        actions_row.addWidget(self.btn_play_channel)
+        actions_row.addWidget(self.btn_add_playlist)
+        actions_row.addStretch()
+        header_layout.addLayout(actions_row)
 
         epg_col.addWidget(self.epg_header)
 
@@ -98,6 +121,7 @@ class EPGWidget(QWidget):
         epg_col.addWidget(self.programs_list, 1)
 
         layout.addLayout(epg_col, 1)
+
 
         self.all_channels: list[MediaItem] = []
         self.favorites: set[str] = set()
@@ -123,18 +147,34 @@ class EPGWidget(QWidget):
             item.setData(Qt.UserRole, ch)
             self.channels_list.addItem(item)
 
-        if self.channels_list.count() > 0:
-            self.channels_list.setCurrentRow(0)
-
-    def _on_channel_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-        if not current:
-            return
-        ch: MediaItem = current.data(Qt.UserRole)
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        ch: MediaItem = item.data(Qt.UserRole)
         if not ch:
             return
-
+        self.selected_channel = ch
         self.channel_title_lbl.setText(ch.title)
+        self.btn_play_channel.setEnabled(True)
+        self.btn_add_playlist.setEnabled(True)
+        self.channel_highlighted.emit(ch)
+
+    def _on_item_activated(self, item: QListWidgetItem) -> None:
+        ch: MediaItem = item.data(Qt.UserRole)
+        if not ch:
+            return
+        self.selected_channel = ch
+        self.channel_title_lbl.setText(ch.title)
+        self.btn_play_channel.setEnabled(True)
+        self.btn_add_playlist.setEnabled(True)
         self.channel_selected.emit(ch)
+
+    def _play_current_channel(self) -> None:
+        if self.selected_channel:
+            self.channel_selected.emit(self.selected_channel)
+
+    def _add_current_to_playlist(self) -> None:
+        if self.selected_channel:
+            self.add_to_playlist_requested.emit(self.selected_channel)
+
 
     def update_epg_listings(self, listings: list[dict[str, Any]]) -> None:
         self.programs_list.clear()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QPixmap
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QPushButton, QScrollArea, QTabWidget, QVBoxLayout,
@@ -20,6 +22,7 @@ class DetailsDialog(QDialog):
     toggle_watchlist_requested = Signal(str)             # content_id
     toggle_favorite_requested = Signal(str)              # content_id
     toggle_episode_watched = Signal(str)                 # episode_id
+    add_to_playlist_requested = Signal(object)           # media_item
 
     def __init__(
         self,
@@ -27,6 +30,7 @@ class DetailsDialog(QDialog):
         episodes_by_season: dict[int, list[Episode]] | None = None,
         is_in_watchlist: bool = False,
         is_favorite: bool = False,
+        poster_pixmap: QPixmap | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -34,6 +38,8 @@ class DetailsDialog(QDialog):
         self.episodes_by_season = episodes_by_season or {}
         self.is_in_watchlist = is_in_watchlist
         self.is_favorite = is_favorite
+        self._net_mgr: QNetworkAccessManager | None = None
+        self._poster_reply: QNetworkReply | None = None
 
         self.setWindowTitle(f"{item.title} — Happitv")
         self.resize(880, 680)
@@ -60,12 +66,14 @@ class DetailsDialog(QDialog):
         hero_layout.setSpacing(24)
 
         # Poster representation
-        poster_lbl = QLabel()
-        poster_lbl.setFixedSize(140, 200)
-        poster_lbl.setAlignment(Qt.AlignCenter)
-        poster_lbl.setStyleSheet("background: #171d2b; border: 1px solid #25334c; border-radius: 6px; font-size: 32px;")
-        poster_lbl.setText("🎬" if item.kind == "movie" else "📺")
-        hero_layout.addWidget(poster_lbl)
+        self.poster_lbl = QLabel()
+        self.poster_lbl.setFixedSize(140, 210)
+        self.poster_lbl.setAlignment(Qt.AlignCenter)
+        self.poster_lbl.setStyleSheet(
+            "background: #171d2b; border: 1px solid #25334c; border-radius: 8px; font-size: 32px;"
+        )
+        self._load_poster(poster_pixmap)
+        hero_layout.addWidget(self.poster_lbl)
 
         # Info column
         info_col = QVBoxLayout()
@@ -123,11 +131,16 @@ class DetailsDialog(QDialog):
         self.btn_fav.clicked.connect(self._toggle_fav)
         actions_row.addWidget(self.btn_fav)
 
+        self.btn_playlist = QPushButton("📁 + Playlist")
+        self.btn_playlist.clicked.connect(lambda: self.add_to_playlist_requested.emit(self.item))
+        actions_row.addWidget(self.btn_playlist)
+
         actions_row.addStretch()
         info_col.addLayout(actions_row)
 
         hero_layout.addLayout(info_col, 1)
         layout.addWidget(hero_card)
+
 
         # Series Season & Episodes Section
         if item.kind == "series" and self.episodes_by_season:
@@ -219,3 +232,45 @@ class DetailsDialog(QDialog):
         eps = self.episodes_by_season.get(season, [])
         if eps:
             self.download_season_requested.emit(self.item, season, eps)
+
+    def _load_poster(self, pixmap: QPixmap | None = None) -> None:
+        if pixmap and not pixmap.isNull():
+            scaled = pixmap.scaled(140, 210, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.poster_lbl.setPixmap(scaled)
+            return
+
+        poster_url = self.item.poster or self.item.backdrop
+        if not poster_url:
+            self.poster_lbl.setText("🎬" if self.item.kind == "movie" else "📺")
+            return
+
+        try:
+            if Path(poster_url).is_file():
+                p = QPixmap(poster_url)
+                if not p.isNull():
+                    self.poster_lbl.setPixmap(p.scaled(140, 210, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    return
+        except Exception:
+            pass
+
+        if poster_url.startswith(("http://", "https://")):
+            self.poster_lbl.setText("⏳")
+            self._net_mgr = QNetworkAccessManager(self)
+            req = QNetworkRequest(QUrl(poster_url))
+            self._poster_reply = self._net_mgr.get(req)
+            self._poster_reply.finished.connect(self._on_poster_downloaded)
+        else:
+            self.poster_lbl.setText("🎬" if self.item.kind == "movie" else "📺")
+
+    def _on_poster_downloaded(self) -> None:
+        if not self._poster_reply:
+            return
+        if self._poster_reply.error() == QNetworkReply.NetworkError.NoError:
+            data = self._poster_reply.readAll()
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                scaled = pix.scaled(140, 210, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.poster_lbl.setPixmap(scaled)
+                return
+        self.poster_lbl.setText("🎬" if self.item.kind == "movie" else "📺")
+

@@ -30,13 +30,14 @@ O Happiptv é um cliente desktop local-first. A versão atual protege contra os 
 
 1. Execute `python -m pytest -q`, `bandit -r app -ll` e `pip-audit -r requirements.txt`.
 2. Gere o executável em um ambiente limpo e reproduzível.
-3. Assine o `.exe` com um certificado de code signing e timestamp confiável.
+3. Assine o `.exe` com um certificado de code signing e timestamp confiável usando `python scripts/sign_exe.py --exe dist/Happiptv.exe --cert <cert.pfx>`.
 4. Publique SHA-256 de cada artefato e verifique-o antes do upload.
 5. Use GitHub Releases e proteja a branch principal com revisão e CI obrigatório.
 6. Ative Dependabot, secret scanning, push protection e CodeQL nas configurações do repositório.
 7. Nunca inclua `config.json`, caches, históricos, playlists, dumps ou credenciais em releases.
 8. Se optar por licença comercial, faça a validação no servidor com tokens curtos e revogáveis. Não coloque uma chave-mestra no executável.
-9. Defina uma licença de software explícita antes de distribuir. A escolha é jurídica/comercial e não deve ser inferida pelo código.
+9. A licença de software foi definida explicitamente no arquivo [LICENSE](LICENSE) (Blue Lab EULA Comercial).
+
 
 ## Resposta a incidentes
 

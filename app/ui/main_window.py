@@ -26,7 +26,7 @@ from app.config import AppConfig, ConfigStore
 from app.download_manager import DownloadManager
 from app.m3u_parser import parse_m3u_content
 from app.models import (
-    Account, DownloadStatus, DownloadTask, Episode, MediaItem,
+    Account, CustomPlaylist, DownloadStatus, DownloadTask, Episode, MediaItem,
     Profile, format_duration, human_size, safe_filename,
 )
 from app.paths import app_data_dir, default_download_dir
@@ -300,9 +300,15 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._connect_signals()
 
-        # Initial view load
+        # Initial view load (populate from cached catalog immediately)
+        self._populate_all_views()
         self._refresh_home_view()
         self._update_source_health_ui()
+
+        # Silent background sync if accounts are configured
+        if self.config.accounts:
+            QTimer.singleShot(1200, self._auto_background_sync)
+
 
     def _get_active_profile(self) -> Profile:
         for p_dict in self.config.profiles:
@@ -440,6 +446,20 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch()
 
+        # Return to "Now Playing" Button in Sidebar
+        self.btn_now_playing = QPushButton("▶ REPRODUZINDO AGORA")
+        self.btn_now_playing.setProperty("nav", True)
+        self.btn_now_playing.setStyleSheet(
+            "QPushButton { background: #0e1726; color: #00e054; border: 1px solid #1a2a44; "
+            "text-align: left; padding: 9px 12px; font-weight: 800; font-family: 'DM Mono', Consolas, monospace; "
+            "font-size: 11px; border-radius: 6px; } "
+            "QPushButton:hover { background: #15233a; border-color: #2258ff; color: #22ff77; }"
+        )
+        self.btn_now_playing.setCheckable(True)
+        self.btn_now_playing.clicked.connect(self._return_to_player)
+        self.btn_now_playing.hide()
+        sidebar_layout.addWidget(self.btn_now_playing)
+
         # Active Download Banner at bottom of sidebar
         self.download_banner = DownloadProgressBanner(on_open_downloads=lambda: self._switch_tab(5))
         self.movie_download_banner = self.download_banner
@@ -447,6 +467,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.download_banner)
 
         body_splitter.addWidget(sidebar)
+
 
         # 3. Content View Stack
         self.view_stack = QStackedWidget()
@@ -512,6 +533,8 @@ class MainWindow(QMainWindow):
     def _switch_tab(self, index: int) -> None:
         for i, btn in enumerate(self.nav_btns):
             btn.setChecked(i == index)
+        if hasattr(self, "btn_now_playing"):
+            self.btn_now_playing.setChecked(index == 8)
         self.view_stack.setCurrentIndex(index)
         if index == 0:
             self._refresh_home_view()
@@ -519,6 +542,16 @@ class MainWindow(QMainWindow):
             self._refresh_offline_view()
         elif index == 6:
             self._refresh_lists_view()
+        elif index == 7:
+            self._refresh_profiles_list()
+
+    def _return_to_player(self) -> None:
+        for btn in self.nav_btns:
+            btn.setChecked(False)
+        if hasattr(self, "btn_now_playing"):
+            self.btn_now_playing.setChecked(True)
+        self.view_stack.setCurrentIndex(8)
+
 
     def _create_home_view(self) -> QWidget:
         widget = QWidget()
@@ -602,9 +635,12 @@ class MainWindow(QMainWindow):
 
         self.epg_widget = EPGWidget(self)
         self.epg_widget.channel_selected.connect(self._on_live_channel_selected)
+        self.epg_widget.channel_highlighted.connect(self._on_live_channel_highlighted)
+        self.epg_widget.add_to_playlist_requested.connect(self._show_add_to_playlist_dialog)
         layout.addWidget(self.epg_widget, 1)
 
         return widget
+
 
     def _create_catalog_view(self, kind: str) -> QWidget:
         widget = QWidget()
@@ -826,8 +862,76 @@ class MainWindow(QMainWindow):
         self.history_list = QListWidget()
         self.history_list.itemDoubleClicked.connect(self._on_continue_item_clicked)
         hist_layout.addWidget(self.history_list, 1)
-
         tabs.addTab(hist_tab, "Histórico")
+
+        # Tab: Playlists Personalizadas (CRUD, Cores, Emojis)
+        playlists_tab = QWidget()
+        pl_layout = QVBoxLayout(playlists_tab)
+        pl_layout.setContentsMargins(6, 8, 6, 8)
+        pl_layout.setSpacing(10)
+
+        pl_top_row = QHBoxLayout()
+        pl_top_row.setSpacing(8)
+        btn_new_pl = QPushButton("+ Nova Playlist")
+        btn_new_pl.setProperty("primary", True)
+        btn_new_pl.clicked.connect(self._show_create_playlist_dialog)
+
+        btn_edit_pl = QPushButton("Editar / Renomear")
+        btn_edit_pl.clicked.connect(self._show_edit_playlist_dialog)
+
+        btn_del_pl = QPushButton("Excluir Playlist")
+        btn_del_pl.setProperty("danger", True)
+        btn_del_pl.clicked.connect(self._delete_selected_playlist)
+
+        pl_top_row.addWidget(btn_new_pl)
+        pl_top_row.addWidget(btn_edit_pl)
+        pl_top_row.addWidget(btn_del_pl)
+        pl_top_row.addStretch()
+        pl_layout.addLayout(pl_top_row)
+
+        pl_splitter = QSplitter(Qt.Horizontal)
+
+        # Left Column: Playlists list
+        left_box = QFrame()
+        left_box.setStyleSheet("background: #0f1420; border: 1px solid #1c2536; border-radius: 6px; padding: 6px;")
+        left_layout = QVBoxLayout(left_box)
+        left_lbl = QLabel("SUAS PLAYLISTS")
+        left_lbl.setStyleSheet("font-family: 'DM Mono'; font-size: 11px; font-weight: 800; color: #1749e8;")
+        left_layout.addWidget(left_lbl)
+        self.custom_playlists_list = QListWidget()
+        self.custom_playlists_list.currentItemChanged.connect(self._on_playlist_selection_changed)
+        left_layout.addWidget(self.custom_playlists_list, 1)
+        pl_splitter.addWidget(left_box)
+
+        # Right Column: Items inside the selected playlist
+        right_box = QFrame()
+        right_box.setStyleSheet("background: #0f1420; border: 1px solid #1c2536; border-radius: 6px; padding: 6px;")
+        right_layout = QVBoxLayout(right_box)
+        self.playlist_items_header = QLabel("CONTEÚDO DA PLAYLIST")
+        self.playlist_items_header.setStyleSheet("font-family: 'DM Mono'; font-size: 11px; font-weight: 800; color: #cbd5e1;")
+        right_layout.addWidget(self.playlist_items_header)
+
+        self.playlist_items_list = QListWidget()
+        self.playlist_items_list.itemDoubleClicked.connect(self._on_home_media_clicked)
+        right_layout.addWidget(self.playlist_items_list, 1)
+
+        pl_items_actions = QHBoxLayout()
+        btn_play_pl_item = QPushButton("▶ Reproduzir Item")
+        btn_play_pl_item.setProperty("primary", True)
+        btn_play_pl_item.clicked.connect(self._play_selected_playlist_item)
+        btn_remove_pl_item = QPushButton("Remover da Playlist")
+        btn_remove_pl_item.clicked.connect(self._remove_selected_playlist_item)
+        pl_items_actions.addWidget(btn_play_pl_item)
+        pl_items_actions.addWidget(btn_remove_pl_item)
+        pl_items_actions.addStretch()
+        right_layout.addLayout(pl_items_actions)
+
+        pl_splitter.addWidget(right_box)
+        pl_splitter.setSizes([320, 560])
+        pl_layout.addWidget(pl_splitter, 1)
+
+        tabs.addTab(playlists_tab, "📁 Playlists Personalizadas")
+
         layout.addWidget(tabs)
         return widget
 
@@ -872,16 +976,34 @@ class MainWindow(QMainWindow):
         prof_group = QGroupBox("PERFIS DE USUÁRIO // CONFIGURAÇÃO")
         prof_layout = QVBoxLayout(prof_group)
         self.profiles_list_w = QListWidget()
-        self.profiles_list_w.setFixedHeight(100)
+        self.profiles_list_w.setFixedHeight(120)
+        self.profiles_list_w.itemDoubleClicked.connect(self._switch_selected_profile)
         prof_layout.addWidget(self.profiles_list_w)
 
         prof_btns = QHBoxLayout()
+        btn_switch_prof = QPushButton("Alternar para Perfil Selecionado")
+        btn_switch_prof.setProperty("primary", True)
+        btn_switch_prof.clicked.connect(self._switch_selected_profile)
+
         btn_add_prof = QPushButton("+ Novo Perfil")
         btn_add_prof.clicked.connect(self._show_add_profile_dialog)
+
+        btn_edit_prof = QPushButton("Editar Perfil")
+        btn_edit_prof.clicked.connect(self._edit_selected_profile)
+
+        btn_delete_prof = QPushButton("Excluir Perfil")
+        btn_delete_prof.setProperty("danger", True)
+        btn_delete_prof.clicked.connect(self._delete_selected_profile)
+
+        prof_btns.addWidget(btn_switch_prof)
         prof_btns.addWidget(btn_add_prof)
+        prof_btns.addWidget(btn_edit_prof)
+        prof_btns.addWidget(btn_delete_prof)
         prof_btns.addStretch()
         prof_layout.addLayout(prof_btns)
         c_layout.addWidget(prof_group)
+        self._refresh_profiles_list()
+
 
         # 3. Parental Control & PIN
         parental_group = QGroupBox("CONTROLE PARENTAL & BLOQUEIO DE CATEGORIAS")
@@ -941,6 +1063,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_Space), self, self.player_widget.toggle_play)
         QShortcut(QKeySequence(Qt.Key_F), self, self.player_widget.toggle_fullscreen)
         QShortcut(QKeySequence(Qt.Key_M), self, self.player_widget.toggle_mute)
+        QShortcut(QKeySequence(Qt.Key_H), self, self.player_widget.toggle_controls_bar)
         QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self.player_widget.seek_relative(-10000))
         QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self.player_widget.seek_relative(10000))
         QShortcut(QKeySequence(Qt.Key_D), self, self.player_widget.toggle_diagnostics)
@@ -963,12 +1086,28 @@ class MainWindow(QMainWindow):
         self.player_widget.fullscreen_toggled.connect(self._on_player_fullscreen_toggled)
         self.player_widget.cinema_mode_toggled.connect(self._on_player_cinema_toggled)
         self.player_widget.previous_channel_requested.connect(self._on_return_previous_channel)
+        self.player_widget.download_requested.connect(self._on_player_download_requested)
 
     # -------------------------------------------------------------
     # Sync, Catalog Population & Health Checks
     # -------------------------------------------------------------
 
+    def _auto_background_sync(self) -> None:
+        if not self.config.accounts:
+            return
+        acc_id = self.config.active_account_id
+        target_accs = [
+            Account.from_dict(d) for d in self.config.accounts
+            if (acc_id == "all" or d.get("id") == acc_id)
+        ]
+        for acc in target_accs:
+            worker = SyncWorker(acc)
+            worker.signals.finished.connect(self._on_sync_finished)
+            worker.signals.error.connect(lambda err: None)
+            self.thread_pool.start(worker)
+
     def sync_active_account(self) -> None:
+
         acc_id = self.config.active_account_id
         if not self.config.accounts:
             QMessageBox.information(self, "Sem Contas", "Cadastre uma conta Xtream ou lista M3U em Configurações.")
@@ -1282,12 +1421,25 @@ class MainWindow(QMainWindow):
         is_wl = item.id in self.current_profile.watchlist
         is_fav = item.id in self.current_profile.favorites
 
-        dialog = DetailsDialog(item, episodes_by_season, is_in_watchlist=is_wl, is_favorite=is_fav, parent=self)
+        poster_pixmap = None
+        cached_icon = self._poster_cache.get(item.poster)
+        if cached_icon and not cached_icon.isNull():
+            poster_pixmap = cached_icon.pixmap(140, 210)
+
+        dialog = DetailsDialog(
+            item,
+            episodes_by_season,
+            is_in_watchlist=is_wl,
+            is_favorite=is_fav,
+            poster_pixmap=poster_pixmap,
+            parent=self,
+        )
         dialog.play_requested.connect(self._on_details_play_requested)
         dialog.download_requested.connect(self._on_details_download_requested)
         dialog.download_season_requested.connect(self._on_details_season_download)
         dialog.toggle_watchlist_requested.connect(self._toggle_watchlist)
         dialog.toggle_favorite_requested.connect(self._toggle_favorite)
+        dialog.add_to_playlist_requested.connect(self._show_add_to_playlist_dialog)
         dialog.exec()
 
     def _fetch_series_episodes(self, item: MediaItem) -> dict[int, list[Episode]]:
@@ -1349,6 +1501,14 @@ class MainWindow(QMainWindow):
         cid = content_id or item.id
         self.view_stack.setCurrentIndex(8)
 
+        if hasattr(self, "btn_now_playing"):
+            short_title = item.title if len(item.title) <= 15 else f"{item.title[:15]}…"
+            self.btn_now_playing.setText(f"▶ {short_title}")
+            self.btn_now_playing.setChecked(True)
+            self.btn_now_playing.show()
+            for btn in self.nav_btns:
+                btn.setChecked(False)
+
         self.player_widget.load_media(
             url=stream_url,
             content_id=cid,
@@ -1358,6 +1518,17 @@ class MainWindow(QMainWindow):
         )
         self._add_to_history(item)
 
+    def _on_live_channel_highlighted(self, channel: MediaItem) -> None:
+        self.last_live_channel = channel
+        acc = self._get_account_by_id(channel.account_id)
+        if acc and acc.account_type == "xtream":
+            client = XtreamClient(acc.server_url, acc.username, acc.password)
+            try:
+                epg_data = client.get_short_epg(channel.stream_id)
+                self.epg_widget.update_epg_listings(epg_data)
+            except Exception:
+                self.epg_widget.update_epg_listings([])
+
     def _on_live_channel_selected(self, channel: MediaItem) -> None:
         if self.last_live_channel:
             self.player_widget.last_channel_id = self._stream_url_for_item(self.last_live_channel)
@@ -1366,10 +1537,14 @@ class MainWindow(QMainWindow):
         acc = self._get_account_by_id(channel.account_id)
         if acc and acc.account_type == "xtream":
             client = XtreamClient(acc.server_url, acc.username, acc.password)
-            epg_data = client.get_short_epg(channel.stream_id)
-            self.epg_widget.update_epg_listings(epg_data)
+            try:
+                epg_data = client.get_short_epg(channel.stream_id)
+                self.epg_widget.update_epg_listings(epg_data)
+            except Exception:
+                pass
 
         self._play_item(channel)
+
 
     def _on_return_previous_channel(self) -> None:
         if self.last_live_channel:
@@ -1511,9 +1686,340 @@ class MainWindow(QMainWindow):
                 li.setData(Qt.UserRole, it.id)
                 self.history_list.addItem(li)
 
+        self._refresh_playlists_ui()
+
+    def _refresh_playlists_ui(self) -> None:
+        if not hasattr(self, "custom_playlists_list"):
+            return
+        curr_row = self.custom_playlists_list.currentRow()
+        self.custom_playlists_list.clear()
+        for pl_raw in self.current_profile.custom_playlists:
+            pl = CustomPlaylist.from_dict(pl_raw) if isinstance(pl_raw, dict) else pl_raw
+            count = len(pl.item_ids)
+            item_text = f"{pl.emoji}  {pl.name}  ({count})"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, pl.id)
+            if pl.color:
+                item.setForeground(QColor(pl.color))
+            self.custom_playlists_list.addItem(item)
+
+        if self.custom_playlists_list.count() > 0:
+            target_row = max(0, min(curr_row if curr_row >= 0 else 0, self.custom_playlists_list.count() - 1))
+            self.custom_playlists_list.setCurrentRow(target_row)
+        else:
+            self.playlist_items_list.clear()
+            self.playlist_items_header.setText("NENHUMA PLAYLIST CADASTRADA")
+
+    def _on_playlist_selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
+        self.playlist_items_list.clear()
+        if not current:
+            self.playlist_items_header.setText("SELECIONE UMA PLAYLIST")
+            return
+        pl_id = current.data(Qt.UserRole)
+        playlist = self._get_custom_playlist_by_id(pl_id)
+        if not playlist:
+            return
+
+        self.playlist_items_header.setText(f"{playlist.emoji} {playlist.name.upper()} // {len(playlist.item_ids)} ITENS")
+        type_labels = {"live": "[AO VIVO]", "movie": "[FILME]", "series": "[SÉRIE]"}
+        for it_id in playlist.item_ids:
+            item = self.catalog.items.get(it_id)
+            if item:
+                badge = type_labels.get(item.kind, "[ITEM]")
+                li = QListWidgetItem(f"{badge} {item.title}  •  {item.category_name}")
+                li.setData(Qt.UserRole, item)
+                self.playlist_items_list.addItem(li)
+            else:
+                li = QListWidgetItem(f"● {it_id} (Item indisponível na fonte atual)")
+                li.setData(Qt.UserRole, None)
+                self.playlist_items_list.addItem(li)
+
+    def _get_custom_playlist_by_id(self, pl_id: str) -> CustomPlaylist | None:
+        for p in self.current_profile.custom_playlists:
+            p_obj = CustomPlaylist.from_dict(p) if isinstance(p, dict) else p
+            if p_obj.id == pl_id:
+                return p_obj
+        return None
+
+    def _show_create_playlist_dialog(self) -> None:
+        import uuid
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Nova Playlist Personalizada")
+        dialog.resize(400, 240)
+        layout = QFormLayout(dialog)
+        layout.setSpacing(12)
+
+        name_in = QLineEdit()
+        name_in.setPlaceholderText("Ex: Meus Favoritos de Ação")
+
+        emoji_combo = QComboBox()
+        for em in ("📁", "🎬", "🍿", "⭐", "🔥", "📺", "⚽", "🏆", "🎵", "💎", "❤️", "⚡"):
+            emoji_combo.addItem(em)
+
+        color_combo = QComboBox()
+        colors = [
+            ("#1749e8", "Azul Blue Lab"),
+            ("#00e054", "Verde Esmeralda"),
+            ("#8e44ad", "Roxo"),
+            ("#f39c12", "Âmbar / Laranja"),
+            ("#e74c3c", "Vermelho"),
+            ("#00bcd4", "Ciano"),
+            ("#e91e63", "Rosa"),
+        ]
+        for hex_code, color_name in colors:
+            color_combo.addItem(f"● {color_name}", hex_code)
+
+        layout.addRow("Nome da Playlist:", name_in)
+        layout.addRow("Emoji / Ícone:", emoji_combo)
+        layout.addRow("Cor de Destaque:", color_combo)
+
+        btn_box = QHBoxLayout()
+        btn_save = QPushButton("Criar Playlist")
+        btn_save.setProperty("primary", True)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_box.addWidget(btn_cancel)
+        btn_box.addWidget(btn_save)
+        layout.addRow("", btn_box)
+
+        def save() -> None:
+            name = name_in.text().strip()
+            if not name:
+                QMessageBox.warning(dialog, "Campo obrigatório", "Informe o nome da playlist.")
+                return
+            new_pl = CustomPlaylist(
+                id=f"pl_{uuid.uuid4().hex[:10]}",
+                name=name,
+                emoji=emoji_combo.currentText(),
+                color=color_combo.currentData(),
+                item_ids=[],
+            )
+            self.current_profile.custom_playlists.append(new_pl.to_dict())
+            self._save_profile_state()
+            self._refresh_playlists_ui()
+            dialog.accept()
+
+        btn_save.clicked.connect(save)
+        dialog.exec()
+
+    def _show_edit_playlist_dialog(self) -> None:
+        curr_item = self.custom_playlists_list.currentItem()
+        if not curr_item:
+            QMessageBox.information(self, "Seleção necessária", "Selecione uma playlist para editar.")
+            return
+        pl_id = curr_item.data(Qt.UserRole)
+        playlist = self._get_custom_playlist_by_id(pl_id)
+        if not playlist:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Editar Playlist — {playlist.name}")
+        dialog.resize(400, 240)
+        layout = QFormLayout(dialog)
+        layout.setSpacing(12)
+
+        name_in = QLineEdit(playlist.name)
+        emoji_combo = QComboBox()
+        for em in ("📁", "🎬", "🍿", "⭐", "🔥", "📺", "⚽", "🏆", "🎵", "💎", "❤️", "⚡"):
+            emoji_combo.addItem(em)
+        emoji_combo.setCurrentText(playlist.emoji)
+
+        color_combo = QComboBox()
+        colors = [
+            ("#1749e8", "Azul Blue Lab"),
+            ("#00e054", "Verde Esmeralda"),
+            ("#8e44ad", "Roxo"),
+            ("#f39c12", "Âmbar / Laranja"),
+            ("#e74c3c", "Vermelho"),
+            ("#00bcd4", "Ciano"),
+            ("#e91e63", "Rosa"),
+        ]
+        for idx, (hex_code, color_name) in enumerate(colors):
+            color_combo.addItem(f"● {color_name}", hex_code)
+            if hex_code == playlist.color:
+                color_combo.setCurrentIndex(idx)
+
+        layout.addRow("Nome da Playlist:", name_in)
+        layout.addRow("Emoji / Ícone:", emoji_combo)
+        layout.addRow("Cor de Destaque:", color_combo)
+
+        btn_box = QHBoxLayout()
+        btn_save = QPushButton("Salvar Alterações")
+        btn_save.setProperty("primary", True)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_box.addWidget(btn_cancel)
+        btn_box.addWidget(btn_save)
+        layout.addRow("", btn_box)
+
+        def save() -> None:
+            name = name_in.text().strip()
+            if not name:
+                QMessageBox.warning(dialog, "Campo obrigatório", "Informe o nome da playlist.")
+                return
+            playlist.name = name
+            playlist.emoji = emoji_combo.currentText()
+            playlist.color = color_combo.currentData()
+            for i, p in enumerate(self.current_profile.custom_playlists):
+                p_id = p.get("id") if isinstance(p, dict) else p.id
+                if p_id == playlist.id:
+                    self.current_profile.custom_playlists[i] = playlist.to_dict()
+                    break
+            self._save_profile_state()
+            self._refresh_playlists_ui()
+            dialog.accept()
+
+        btn_save.clicked.connect(save)
+        dialog.exec()
+
+    def _delete_selected_playlist(self) -> None:
+        curr_item = self.custom_playlists_list.currentItem()
+        if not curr_item:
+            QMessageBox.information(self, "Seleção necessária", "Selecione uma playlist para excluir.")
+            return
+        pl_id = curr_item.data(Qt.UserRole)
+        playlist = self._get_custom_playlist_by_id(pl_id)
+        if not playlist:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Excluir Playlist",
+            f"Deseja realmente excluir a playlist '{playlist.emoji} {playlist.name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.current_profile.custom_playlists = [
+                p for p in self.current_profile.custom_playlists
+                if (p.get("id") if isinstance(p, dict) else p.id) != pl_id
+            ]
+            self._save_profile_state()
+            self._refresh_playlists_ui()
+
+    def _play_selected_playlist_item(self) -> None:
+        curr = self.playlist_items_list.currentItem()
+        if not curr:
+            return
+        item: MediaItem = curr.data(Qt.UserRole)
+        if item:
+            self._play_item(item)
+
+    def _remove_selected_playlist_item(self) -> None:
+        curr_pl = self.custom_playlists_list.currentItem()
+        curr_it = self.playlist_items_list.currentItem()
+        if not curr_pl or not curr_it:
+            return
+        pl_id = curr_pl.data(Qt.UserRole)
+        playlist = self._get_custom_playlist_by_id(pl_id)
+        if not playlist:
+            return
+        item: MediaItem | None = curr_it.data(Qt.UserRole)
+        it_id = item.id if item else ""
+        if it_id and it_id in playlist.item_ids:
+            playlist.item_ids.remove(it_id)
+            for i, p in enumerate(self.current_profile.custom_playlists):
+                p_id = p.get("id") if isinstance(p, dict) else p.id
+                if p_id == playlist.id:
+                    self.current_profile.custom_playlists[i] = playlist.to_dict()
+                    break
+            self._save_profile_state()
+            self._on_playlist_selection_changed(curr_pl, None)
+
+    def _show_add_to_playlist_dialog(self, item: MediaItem) -> None:
+        if not self.current_profile.custom_playlists:
+            reply = QMessageBox.question(
+                self,
+                "Sem Playlists",
+                "Você ainda não possui nenhuma playlist criada. Deseja criar uma agora?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._show_create_playlist_dialog()
+                if self.current_profile.custom_playlists:
+                    self._show_add_to_playlist_dialog(item)
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Adicionar à Playlist — {item.title}")
+        dialog.resize(380, 280)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel("Escolha a playlist de destino:"))
+        list_w = QListWidget()
+        for p_raw in self.current_profile.custom_playlists:
+            pl = CustomPlaylist.from_dict(p_raw) if isinstance(p_raw, dict) else p_raw
+            already = " (Já adicionado)" if item.id in pl.item_ids else ""
+            li = QListWidgetItem(f"{pl.emoji}  {pl.name}{already}")
+            li.setData(Qt.UserRole, pl.id)
+            list_w.addItem(li)
+        list_w.setCurrentRow(0)
+        layout.addWidget(list_w, 1)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("Adicionar")
+        btn_add.setProperty("primary", True)
+        btn_new = QPushButton("+ Nova Playlist")
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(dialog.reject)
+
+        btn_row.addWidget(btn_new)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_add)
+        layout.addLayout(btn_row)
+
+        def add_item() -> None:
+            sel = list_w.currentItem()
+            if not sel:
+                return
+            pl_id = sel.data(Qt.UserRole)
+            playlist = self._get_custom_playlist_by_id(pl_id)
+            if playlist:
+                if item.id not in playlist.item_ids:
+                    playlist.item_ids.append(item.id)
+                    for i, p in enumerate(self.current_profile.custom_playlists):
+                        p_id = p.get("id") if isinstance(p, dict) else p.id
+                        if p_id == playlist.id:
+                            self.current_profile.custom_playlists[i] = playlist.to_dict()
+                            break
+                    self._save_profile_state()
+                    self._refresh_playlists_ui()
+                    QMessageBox.information(dialog, "Adicionado", f"'{item.title}' foi adicionado a '{playlist.name}'!")
+                else:
+                    QMessageBox.information(dialog, "Aviso", f"'{item.title}' já está na playlist '{playlist.name}'.")
+            dialog.accept()
+
+        def create_new() -> None:
+            dialog.reject()
+            self._show_create_playlist_dialog()
+            self._show_add_to_playlist_dialog(item)
+
+        btn_add.clicked.connect(add_item)
+        btn_new.clicked.connect(create_new)
+        dialog.exec()
+
     # -------------------------------------------------------------
     # Downloads & Offline Library
     # -------------------------------------------------------------
+
+    def _on_player_download_requested(self, content_id: str, kind: str) -> None:
+        if not content_id:
+            return
+        item = self.catalog.items.get(content_id)
+        if item:
+            self._on_details_download_requested(item, None)
+            return
+        if content_id.startswith("ep_"):
+            for candidate in self.catalog.get_items("series"):
+                if candidate.id in content_id:
+                    eps_by_season = self._fetch_series_episodes(candidate)
+                    for eps in eps_by_season.values():
+                        for ep in eps:
+                            if ep.id == content_id:
+                                self._on_details_download_requested(candidate, ep)
+                                return
+
 
     def _on_details_download_requested(self, item: MediaItem, episode: Episode | None) -> None:
         target_url = episode.stream_url if episode else self._stream_url_for_item(item)
@@ -1933,7 +2439,121 @@ class MainWindow(QMainWindow):
         self.config.profiles.append(prof.to_dict())
         self.config_store.save(self.config)
         self._reload_profiles_combo()
+        self._refresh_profiles_list()
         dialog.accept()
+
+    def _refresh_profiles_list(self) -> None:
+        if not hasattr(self, "profiles_list_w"):
+            return
+        self.profiles_list_w.clear()
+        for p_dict in self.config.profiles:
+            p = Profile.from_dict(p_dict)
+            is_active = (p.id == self.current_profile.id)
+            active_badge = " [ATIVO]" if is_active else ""
+            kids_badge = " [KIDS]" if p.is_kids else ""
+            item_text = f"{p.avatar}  {p.name}{active_badge}{kids_badge}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, p.id)
+            if is_active:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setForeground(QColor("#00e054"))
+            self.profiles_list_w.addItem(item)
+
+    def _switch_selected_profile(self) -> None:
+        curr = self.profiles_list_w.currentItem()
+        if not curr:
+            QMessageBox.information(self, "Seleção necessária", "Selecione um perfil na lista.")
+            return
+        prof_id = curr.data(Qt.UserRole)
+        if prof_id == self.current_profile.id:
+            return
+        self.config.active_profile_id = prof_id
+        self.current_profile = self._get_active_profile()
+        self.config_store.save(self.config)
+        self._reload_profiles_combo()
+        self._populate_all_views()
+        self._refresh_profiles_list()
+        QMessageBox.information(self, "Perfil Alternado", f"Perfil ativo alterado para: {self.current_profile.name}")
+
+    def _edit_selected_profile(self) -> None:
+        curr = self.profiles_list_w.currentItem()
+        if not curr:
+            QMessageBox.information(self, "Seleção necessária", "Selecione um perfil para editar.")
+            return
+        prof_id = curr.data(Qt.UserRole)
+        target_dict = next((p for p in self.config.profiles if p.get("id") == prof_id), None)
+        if not target_dict:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Editar Perfil — {target_dict.get('name')}")
+        layout = QFormLayout(dialog)
+        name_in = QLineEdit(target_dict.get("name", "Perfil"))
+        avatar_in = QComboBox()
+        for av in ("⚡", "🧸", "🎬", "🍿", "🚀", "💎", "⭐", "👾"):
+            avatar_in.addItem(av)
+        avatar_in.setCurrentText(target_dict.get("avatar", "⚡"))
+        kids_chk = QCheckBox("Perfil Infantil")
+        kids_chk.setChecked(bool(target_dict.get("is_kids", False)))
+
+        layout.addRow("Nome:", name_in)
+        layout.addRow("Avatar:", avatar_in)
+        layout.addRow("", kids_chk)
+
+        btn_save = QPushButton("Salvar Alterações")
+        btn_save.setProperty("primary", True)
+        layout.addRow("", btn_save)
+
+        def save() -> None:
+            name = name_in.text().strip()
+            if not name:
+                QMessageBox.warning(dialog, "Campo obrigatório", "Informe o nome do perfil.")
+                return
+            target_dict["name"] = name
+            target_dict["avatar"] = avatar_in.currentText()
+            target_dict["is_kids"] = kids_chk.isChecked()
+            self.config_store.save(self.config)
+            if self.current_profile.id == prof_id:
+                self.current_profile = self._get_active_profile()
+            self._reload_profiles_combo()
+            self._refresh_profiles_list()
+            dialog.accept()
+
+        btn_save.clicked.connect(save)
+        dialog.exec()
+
+    def _delete_selected_profile(self) -> None:
+        curr = self.profiles_list_w.currentItem()
+        if not curr:
+            QMessageBox.information(self, "Seleção necessária", "Selecione um perfil para excluir.")
+            return
+        prof_id = curr.data(Qt.UserRole)
+        if len(self.config.profiles) <= 1:
+            QMessageBox.warning(self, "Ação não permitida", "Não é possível excluir o único perfil existente.")
+            return
+
+        target_dict = next((p for p in self.config.profiles if p.get("id") == prof_id), None)
+        if not target_dict:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Excluir Perfil",
+            f"Deseja realmente excluir o perfil '{target_dict.get('name')}'?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.config.profiles = [p for p in self.config.profiles if p.get("id") != prof_id]
+            if self.config.active_profile_id == prof_id:
+                self.config.active_profile_id = self.config.profiles[0].get("id")
+                self.current_profile = self._get_active_profile()
+            self.config_store.save(self.config)
+            self._reload_profiles_combo()
+            self._populate_all_views()
+            self._refresh_profiles_list()
+
 
     def _export_backup(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Exportar Backup de Configurações", "happitv_backup.json", "JSON (*.json)")

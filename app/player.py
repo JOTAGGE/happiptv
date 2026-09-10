@@ -57,6 +57,7 @@ class VideoPlayerWidget(QWidget):
     previous_channel_requested = Signal()
     fullscreen_toggled = Signal(bool)
     cinema_mode_toggled = Signal(bool)
+    download_requested = Signal(str, str)          # content_id, kind
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -66,8 +67,10 @@ class VideoPlayerWidget(QWidget):
         self.kind: str = "movie"  # "movie", "series", "live"
         self.has_next_episode: bool = False
         self.is_live: bool = False
+        self.is_controls_collapsed: bool = False
         self.last_channel_id: str = ""
         self.stream_diag = StreamDiagnostics()
+
 
         # QtMultimedia Player Setup
         self.player = QMediaPlayer(self)
@@ -151,6 +154,10 @@ class VideoPlayerWidget(QWidget):
         self.btn_next_ep.clicked.connect(self.next_episode_requested.emit)
         self.btn_next_ep.hide()
 
+        # Download button
+        self.btn_download = QPushButton("⬇ Baixar")
+        self.btn_download.clicked.connect(self._on_download_clicked)
+
         # Previous Channel (for Live TV)
         self.btn_prev_channel = QPushButton("↺ Canal Anterior")
         self.btn_prev_channel.clicked.connect(self.previous_channel_requested.emit)
@@ -168,6 +175,10 @@ class VideoPlayerWidget(QWidget):
         self.btn_fullscreen = QPushButton("⛶ Tela Cheia [F]")
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
 
+        # Collapse Controls Toggle
+        self.btn_collapse = QPushButton("▼ Ocultar [H]")
+        self.btn_collapse.clicked.connect(self.toggle_controls_bar)
+
         # Build buttons row
         self.buttons_row.addWidget(self.btn_play)
         self.buttons_row.addWidget(self.btn_rewind)
@@ -178,15 +189,27 @@ class VideoPlayerWidget(QWidget):
         self.buttons_row.addWidget(self.speed_combo)
         self.buttons_row.addWidget(self.btn_audio_tracks)
         self.buttons_row.addWidget(self.btn_sub_tracks)
+        self.buttons_row.addWidget(self.btn_download)
         self.buttons_row.addWidget(self.btn_next_ep)
         self.buttons_row.addWidget(self.btn_prev_channel)
         self.buttons_row.addStretch()
         self.buttons_row.addWidget(self.btn_diagnostics)
         self.buttons_row.addWidget(self.btn_cinema)
         self.buttons_row.addWidget(self.btn_fullscreen)
+        self.buttons_row.addWidget(self.btn_collapse)
 
         self.controls_layout.addLayout(self.buttons_row)
         self.root_layout.addWidget(self.controls_bar)
+
+        # Floating Expand Button (shown when controls are collapsed)
+        self.btn_expand = QPushButton("▲ Controles [H]", self)
+        self.btn_expand.setStyleSheet(
+            "background: rgba(17, 21, 31, 0.9); color: #ffffff; border: 1px solid #1c2434; "
+            "border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: 700; "
+            "font-family: 'DM Mono', Consolas, monospace;"
+        )
+        self.btn_expand.clicked.connect(self.toggle_controls_bar)
+        self.btn_expand.hide()
 
         # Floating Diagnostics HUD
         self.hud = StreamDiagnosticsOverlay(self)
@@ -211,6 +234,9 @@ class VideoPlayerWidget(QWidget):
         super().resizeEvent(event)
         # Position floating HUD top-right
         self.hud.move(self.width() - self.hud.width() - 20, 20)
+        hint = self.btn_expand.sizeHint()
+        self.btn_expand.move((self.width() - hint.width()) // 2, self.height() - hint.height() - 8)
+
 
     def load_media(
         self,
@@ -229,6 +255,7 @@ class VideoPlayerWidget(QWidget):
 
         self.btn_next_ep.setVisible(has_next_ep)
         self.btn_prev_channel.setVisible(self.is_live)
+        self.btn_download.setVisible(not self.is_live)
         self.timeline_row.setEnabled(not self.is_live)
 
         if self.is_live:
@@ -394,11 +421,38 @@ class VideoPlayerWidget(QWidget):
             pos = int((self.slider.value() / 1000.0) * dur)
             self.player.setPosition(pos)
 
+    def _on_download_clicked(self) -> None:
+        if self.content_id and not self.is_live:
+            self.download_requested.emit(self.content_id, self.kind)
+            self.btn_download.setText("✓ Baixando...")
+            QTimer.singleShot(2500, lambda: self.btn_download.setText("⬇ Baixar"))
+
+    def toggle_controls_bar(self) -> None:
+        self.is_controls_collapsed = not self.is_controls_collapsed
+        if self.is_controls_collapsed:
+            self.controls_bar.hide()
+            self.btn_expand.show()
+            self.btn_expand.raise_()
+            hint = self.btn_expand.sizeHint()
+            self.btn_expand.move((self.width() - hint.width()) // 2, self.height() - hint.height() - 8)
+        else:
+            self.controls_bar.show()
+            self.btn_expand.hide()
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         super().mouseMoveEvent(event)
-        self.controls_bar.show()
-        self.controls_hide_timer.start()
+        if not self.is_controls_collapsed:
+            self.controls_bar.show()
+            self.controls_hide_timer.start()
+        else:
+            y = event.position().y() if hasattr(event, "position") else event.y()
+            if y > self.height() - 70:
+                self.btn_expand.show()
+                self.btn_expand.raise_()
 
     def _auto_hide_controls(self) -> None:
+        if self.is_controls_collapsed:
+            return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState and (self.is_fullscreen_state or self.is_cinema_state):
             self.controls_bar.hide()
+

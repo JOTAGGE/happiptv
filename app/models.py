@@ -129,6 +129,24 @@ class Account:
 
 
 @dataclass(slots=True)
+class CustomPlaylist:
+    id: str
+    name: str
+    emoji: str = "📁"
+    color: str = "#1749e8"
+    item_ids: list[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CustomPlaylist":
+        allowed = set(cls.__dataclass_fields__.keys())
+        return cls(**{k: v for k, v in data.items() if k in allowed})
+
+
+@dataclass(slots=True)
 class Profile:
     id: str
     name: str
@@ -140,6 +158,7 @@ class Profile:
     progress: dict[str, dict[str, Any]] = field(default_factory=dict)  # id -> {position_ms, duration_ms, updated_at}
     history: list[dict[str, Any]] = field(default_factory=list)        # [{id, title, kind, timestamp, progress_pct}]
     hidden_categories: list[str] = field(default_factory=list)
+    custom_playlists: list[dict[str, Any]] = field(default_factory=list)  # list of CustomPlaylist dicts
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -148,6 +167,7 @@ class Profile:
     def from_dict(cls, data: dict[str, Any]) -> "Profile":
         allowed = set(cls.__dataclass_fields__.keys())
         return cls(**{k: v for k, v in data.items() if k in allowed})
+
 
 
 @dataclass(slots=True)
