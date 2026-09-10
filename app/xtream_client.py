@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+import json
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -16,6 +17,21 @@ class AuthenticationError(XtreamError):
     pass
 
 
+MAX_API_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+def normalize_server_url(value: str) -> str:
+    candidate = value.strip().rstrip("/")
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"http://{candidate}"
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise XtreamError("Use uma URL de servidor HTTP ou HTTPS válida.")
+    if parsed.username or parsed.password or any(ord(char) < 32 for char in candidate):
+        raise XtreamError("A URL base não pode conter credenciais ou caracteres de controle.")
+    return candidate
+
+
 @dataclass(slots=True)
 class XtreamClient:
     server_url: str
@@ -24,9 +40,7 @@ class XtreamClient:
     timeout: tuple[int, int] = (8, 30)
 
     def __post_init__(self) -> None:
-        self.server_url = self.server_url.strip().rstrip("/")
-        if not self.server_url.startswith(("http://", "https://")):
-            self.server_url = f"http://{self.server_url}"
+        self.server_url = normalize_server_url(self.server_url)
 
     def _request(self, action: str | None = None, **params: Any) -> Any:
         payload = {"username": self.username, "password": self.password, **params}
@@ -37,14 +51,29 @@ class XtreamClient:
                 f"{self.server_url}/player_api.php",
                 params=payload,
                 timeout=self.timeout,
+                stream=True,
             )
-            response.raise_for_status()
-            data = response.json()
+            with response:
+                if response.status_code >= 400:
+                    raise XtreamError(f"O servidor recusou a solicitação (HTTP {response.status_code}).")
+                content_length = response.headers.get("Content-Length", "")
+                if content_length.isdigit() and int(content_length) > MAX_API_RESPONSE_BYTES:
+                    raise XtreamError("O catálogo retornado excede o limite seguro de 64 MB.")
+                chunks: list[bytes] = []
+                received = 0
+                for chunk in response.iter_content(256 * 1024):
+                    received += len(chunk)
+                    if received > MAX_API_RESPONSE_BYTES:
+                        raise XtreamError("O catálogo retornado excede o limite seguro de 64 MB.")
+                    chunks.append(chunk)
+                data = json.loads(b"".join(chunks))
+        except XtreamError:
+            raise
         except requests.Timeout as exc:
             raise XtreamError("O servidor demorou demais para responder.") from exc
         except requests.RequestException as exc:
-            raise XtreamError(f"Não foi possível conectar ao servidor: {exc}") from exc
-        except ValueError as exc:
+            raise XtreamError("Não foi possível conectar ao servidor. Confira a URL e sua rede.") from exc
+        except (ValueError, json.JSONDecodeError) as exc:
             raise XtreamError("O servidor retornou uma resposta inválida.") from exc
 
         if isinstance(data, dict) and data.get("user_info", {}).get("auth") in (0, "0"):

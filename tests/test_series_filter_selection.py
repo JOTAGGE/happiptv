@@ -30,6 +30,29 @@ def test_matches_search_typo_and_accent_tolerance() -> None:
 
     # Category in combined target
     assert matches_search("netflix", "Black Mirror NETFLIX")
+    assert not matches_search("dark", "The Last Kingdom")
+
+
+def test_global_search_has_dedicated_results_view(qtbot, monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    from app.models import MediaItem
+    window.catalog.add_items([
+        MediaItem(id="m1", kind="movie", title="Cidade de Deus", stream_id=1, category_name="Nacionais"),
+        MediaItem(id="s1", kind="series", title="Cidade Invisível", stream_id=2, category_name="Netflix"),
+        MediaItem(id="l1", kind="live", title="Canal Cidade", stream_id=3, category_name="Notícias"),
+    ])
+    window.search_input.setText("cidade")
+    window._execute_global_search()
+
+    assert window.view_stack.currentWidget() is window.view_search
+    assert window.global_results.topLevelItemCount() == 3
+    assert "3 resultados" in window.search_summary.text()
+
+    window.search_input.clear()
+    assert window.view_stack.currentWidget() is not window.view_search
 
 
 def test_streaming_keywords_coverage() -> None:

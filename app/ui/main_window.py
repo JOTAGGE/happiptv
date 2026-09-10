@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import difflib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import time
-import unicodedata
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QObject, QPoint, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
@@ -23,7 +21,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from app.catalog_manager import CatalogManager
+from app.catalog_manager import CatalogManager, matches_query, normalize_text, search_score
 from app.config import AppConfig, ConfigStore
 from app.download_manager import DownloadManager
 from app.m3u_parser import parse_m3u_content
@@ -40,38 +38,9 @@ from app.ui.style import STYLESHEET
 from app.xtream_client import XtreamClient
 
 
-def normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    nfkd = unicodedata.normalize("NFKD", str(text))
-    return "".join(c for c in nfkd if not unicodedata.combining(c)).casefold().strip()
-
-
 def matches_search(query: str, target: str) -> bool:
-    norm_q = normalize_text(query)
-    if not norm_q:
-        return True
-    norm_t = normalize_text(target)
-    if not norm_t:
-        return False
-    if norm_q in norm_t:
-        return True
-    # Extra trailing character typo tolerance (e.g. "shamelesse" -> "shameless")
-    if len(norm_q) >= 4 and norm_q[:-1] in norm_t:
-        return True
-    # Word similarity and substring check
-    target_words = re.findall(r"[\w']+", norm_t)
-    for word in target_words:
-        if norm_q in word or word in norm_q:
-            return True
-        if len(norm_q) >= 4 and len(word) >= 4:
-            if difflib.SequenceMatcher(None, norm_q, word).ratio() >= 0.75:
-                return True
-    # Token matching (all query words present in target)
-    q_words = norm_q.split()
-    if len(q_words) > 1 and all(any(qw in tw for tw in target_words) for qw in q_words):
-        return True
-    return False
+    """Compatibility wrapper around the catalog's single search implementation."""
+    return matches_query(query, target)
 
 
 STREAMING_PRESETS: list[tuple[str, str, list[str]]] = [
@@ -174,11 +143,22 @@ class SyncWorker(QRunnable):
         items = []
         if self.account.m3u_url.startswith(("http://", "https://")):
             import requests
-            resp = requests.get(self.account.m3u_url, timeout=(10, 30))
-            resp.raise_for_status()
-            items = parse_m3u_content(resp.text, self.account.id)
+            with requests.get(self.account.m3u_url, timeout=(10, 30), stream=True) as resp:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                received = 0
+                for chunk in resp.iter_content(128 * 1024):
+                    received += len(chunk)
+                    if received > 16 * 1024 * 1024:
+                        raise ValueError("A lista M3U excede o limite seguro de 16 MB.")
+                    chunks.append(chunk)
+                text = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+                items = parse_m3u_content(text, self.account.id)
         elif Path(self.account.m3u_url).exists():
-            text = Path(self.account.m3u_url).read_text(encoding="utf-8", errors="ignore")
+            playlist_path = Path(self.account.m3u_url)
+            if playlist_path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("A lista M3U excede o limite seguro de 16 MB.")
+            text = playlist_path.read_text(encoding="utf-8", errors="ignore")
             items = parse_m3u_content(text, self.account.id)
         stats = {"latency_ms": 30, "status": "Online (M3U)"}
         self.signals.finished.emit(items, stats)
@@ -286,14 +266,29 @@ class MainWindow(QMainWindow):
         self.config_store = ConfigStore()
         self.config, self.password = self.config_store.load()
         self.catalog = CatalogManager()
-        self.download_manager = DownloadManager(max_concurrent=self.config.max_concurrent_downloads)
-        self.download_manager.configure(self.config.max_concurrent_downloads, self.config.use_ffmpeg_fallback)
+        self.download_manager = DownloadManager(
+            max_concurrent=self.config.max_concurrent_downloads,
+            download_root=Path(self.config.download_dir),
+        )
+        self.download_manager.configure(
+            self.config.max_concurrent_downloads,
+            self.config.use_ffmpeg_fallback,
+            self.config.download_dir,
+        )
 
         # Legacy compatibility references
         self.downloads = self.download_manager
         self.series_data: list[dict[str, Any]] = []
 
         self.thread_pool = QThreadPool(self)
+        self.poster_network = QNetworkAccessManager(self)
+        self._poster_cache: dict[str, QIcon] = {}
+        self._poster_replies: set[QNetworkReply] = set()
+        self._search_origin_index = 0
+        self._global_search_timer = QTimer(self)
+        self._global_search_timer.setSingleShot(True)
+        self._global_search_timer.setInterval(220)
+        self._global_search_timer.timeout.connect(self._execute_global_search)
 
         # State Variables
         self.current_profile: Profile = self._get_active_profile()
@@ -358,10 +353,13 @@ class MainWindow(QMainWindow):
 
         # Global Search
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 Busca global (Canais, Filmes, Séries, Offline)... [Ctrl+F]")
-        self.search_input.setFixedWidth(380)
+        self.search_input.setObjectName("GlobalSearch")
+        self.search_input.setPlaceholderText("Buscar canais, filmes e séries…   Ctrl+F")
+        self.search_input.setMinimumWidth(320)
+        self.search_input.setMaximumWidth(520)
+        self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._on_search_query_changed)
-        header_layout.addWidget(self.search_input)
+        header_layout.addWidget(self.search_input, 1)
 
         header_layout.addStretch()
 
@@ -490,6 +488,10 @@ class MainWindow(QMainWindow):
         self.player_widget = VideoPlayerWidget(self)
         self.view_stack.addWidget(self.player_widget)
 
+        # View 9: Global search results
+        self.view_search = self._create_search_view()
+        self.view_stack.addWidget(self.view_search)
+
         body_splitter.addWidget(self.view_stack)
         main_layout.addWidget(body_splitter, 1)
 
@@ -532,49 +534,59 @@ class MainWindow(QMainWindow):
         c_layout = QVBoxLayout(content)
         c_layout.setSpacing(24)
 
-        # Hero Banner
+        # Editorial hero: streaming hierarchy with Blue Lab's oversized type.
         self.hero_box = QFrame()
         self.hero_box.setObjectName("HeroBackdropCard")
-        self.hero_box.setStyleSheet("background: #11151f; border: 1px solid #1c2435; border-radius: 8px; padding: 24px;")
-        h_layout = QVBoxLayout(self.hero_box)
-        h_layout.setSpacing(10)
-
-        hk = QLabel("01 // DESTAQUE BLUE LAB")
-        hk.setStyleSheet("font-family: 'DM Mono'; font-size: 11px; color: #1749e8; font-weight: 800;")
-        self.hero_title = QLabel("HAPPIPTV — EXPERIMENTAL STREAMING")
-        self.hero_title.setStyleSheet("font-size: 28px; font-weight: 900; color: #ffffff;")
-        self.hero_desc = QLabel("Bem-vindo à nova geração do Happiptv. Conecte sua fonte IPTV ou acesse sua Biblioteca Offline.")
-        self.hero_desc.setStyleSheet("color: #9aa7bc; font-size: 14px;")
-
-        self.btn_hero_action = QPushButton("▶ Explorar Catálogo")
+        self.hero_box.setMinimumHeight(280)
+        hero_layout = QHBoxLayout(self.hero_box)
+        hero_layout.setContentsMargins(34, 28, 30, 28)
+        hero_layout.setSpacing(24)
+        hero_copy = QVBoxLayout()
+        hero_copy.setSpacing(10)
+        hk = QLabel("CURADORIA // HAPPIPTV 2026—")
+        hk.setProperty("kicker", True)
+        self.hero_title = QLabel("STREAMING\nSEM RUÍDO")
+        self.hero_title.setWordWrap(True)
+        self.hero_title.setStyleSheet("font-size: 42px; font-weight: 900; color: #ffffff; letter-spacing: -1.4px;")
+        self.hero_desc = QLabel("Sua programação, seus filmes e sua biblioteca offline em um só lugar.")
+        self.hero_desc.setWordWrap(True)
+        self.hero_desc.setMaximumWidth(610)
+        self.hero_desc.setStyleSheet("color: #a9b5c9; font-size: 14px;")
+        self.btn_hero_action = QPushButton("Explorar filmes  →")
         self.btn_hero_action.setProperty("primary", True)
-        self.btn_hero_action.setFixedWidth(180)
-        self.btn_hero_action.clicked.connect(lambda: self._switch_tab(2))
-
-        h_layout.addWidget(hk)
-        h_layout.addWidget(self.hero_title)
-        h_layout.addWidget(self.hero_desc)
-        h_layout.addWidget(self.btn_hero_action)
+        self.btn_hero_action.setFixedWidth(170)
+        self.btn_hero_action.clicked.connect(self._open_hero_item)
+        hero_copy.addWidget(hk)
+        hero_copy.addWidget(self.hero_title)
+        hero_copy.addWidget(self.hero_desc)
+        hero_copy.addSpacing(6)
+        hero_copy.addWidget(self.btn_hero_action, 0, Qt.AlignLeft)
+        hero_copy.addStretch()
+        hero_mark = QLabel("HAPPI\nTV")
+        hero_mark.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        hero_mark.setStyleSheet("font-size: 74px; font-weight: 900; color: #2b5cff; letter-spacing: -4px;")
+        hero_layout.addLayout(hero_copy, 3)
+        hero_layout.addWidget(hero_mark, 2)
         c_layout.addWidget(self.hero_box)
 
         # Section: Continuar Assistindo
         c_layout.addWidget(self._make_section_title("CONTINUAR ASSISTINDO"))
         self.continue_watching_list = QListWidget()
-        self.continue_watching_list.setFixedHeight(120)
+        self._configure_media_rail(self.continue_watching_list)
         self.continue_watching_list.itemDoubleClicked.connect(self._on_continue_item_clicked)
         c_layout.addWidget(self.continue_watching_list)
 
         # Section: Favoritos
         c_layout.addWidget(self._make_section_title("FAVORITOS"))
         self.home_favs_list = QListWidget()
-        self.home_favs_list.setFixedHeight(140)
+        self._configure_media_rail(self.home_favs_list)
         self.home_favs_list.itemDoubleClicked.connect(self._on_home_media_clicked)
         c_layout.addWidget(self.home_favs_list)
 
         # Section: Minha Lista (Watchlist)
         c_layout.addWidget(self._make_section_title("MINHA LISTA (QUERO ASSISTIR)"))
         self.home_watchlist_list = QListWidget()
-        self.home_watchlist_list.setFixedHeight(140)
+        self._configure_media_rail(self.home_watchlist_list)
         self.home_watchlist_list.itemDoubleClicked.connect(self._on_home_media_clicked)
         c_layout.addWidget(self.home_watchlist_list)
 
@@ -597,11 +609,32 @@ class MainWindow(QMainWindow):
     def _create_catalog_view(self, kind: str) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(24, 18, 24, 20)
-        layout.setSpacing(14)
+        layout.setContentsMargins(30, 24, 30, 26)
+        layout.setSpacing(18)
+
+        heading_row = QHBoxLayout()
+        title = QLabel("FILMES" if kind == "movie" else "SÉRIES")
+        title.setProperty("heading", True)
+        subtitle = QLabel("Sua biblioteca, ordenada por relevância")
+        subtitle.setProperty("muted", True)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(3)
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        count_label = QLabel("0 títulos")
+        count_label.setObjectName("ResultCount")
+        count_label.setProperty("mono", True)
+        heading_row.addLayout(title_col)
+        heading_row.addStretch()
+        heading_row.addWidget(count_label, 0, Qt.AlignBottom)
+        layout.addLayout(heading_row)
 
         # Filter bar
-        bar = QHBoxLayout()
+        filter_panel = QFrame()
+        filter_panel.setObjectName("FilterPanel")
+        bar = QHBoxLayout(filter_panel)
+        bar.setContentsMargins(12, 10, 12, 10)
+        bar.setSpacing(10)
         cat_combo = QComboBox()
         cat_combo.addItem("Todas as categorias", "all")
         bar.addWidget(cat_combo)
@@ -613,28 +646,96 @@ class MainWindow(QMainWindow):
         bar.addWidget(stream_combo)
 
         search_edit = QLineEdit()
-        search_edit.setPlaceholderText("🔍 Filtrar neste catálogo...")
-        bar.addWidget(search_edit)
+        search_edit.setPlaceholderText("Pesquisar por título ou categoria…")
+        search_edit.setClearButtonEnabled(True)
+        bar.addWidget(search_edit, 1)
 
         list_w = QListWidget()
+        list_w.setObjectName("CatalogGrid")
+        list_w.setViewMode(QListWidget.ViewMode.IconMode)
+        list_w.setResizeMode(QListWidget.ResizeMode.Adjust)
+        list_w.setMovement(QListWidget.Movement.Static)
+        list_w.setWrapping(True)
+        list_w.setSpacing(12)
+        list_w.setIconSize(QSize(148, 208))
+        list_w.setGridSize(QSize(184, 278))
+        list_w.setWordWrap(True)
+        list_w.setUniformItemSizes(True)
         list_w.itemDoubleClicked.connect(self._on_catalog_item_clicked)
 
         cat_combo.currentIndexChanged.connect(lambda: self._filter_catalog_view(kind, cat_combo, search_edit, list_w, stream_combo))
         stream_combo.currentIndexChanged.connect(lambda: self._filter_catalog_view(kind, cat_combo, search_edit, list_w, stream_combo))
-        search_edit.textChanged.connect(lambda: self._filter_catalog_view(kind, cat_combo, search_edit, list_w, stream_combo))
+        search_timer = QTimer(widget)
+        search_timer.setSingleShot(True)
+        search_timer.setInterval(180)
+        search_timer.timeout.connect(lambda: self._filter_catalog_view(kind, cat_combo, search_edit, list_w, stream_combo))
+        search_edit.textChanged.connect(lambda _text: search_timer.start())
 
         btn_refresh = QPushButton("↻ Atualizar")
         btn_refresh.clicked.connect(lambda: self._populate_catalog_view(kind, cat_combo, list_w))
         bar.addWidget(btn_refresh)
 
-        layout.addLayout(bar)
+        layout.addWidget(filter_panel)
         layout.addWidget(list_w, 1)
 
         setattr(self, f"{kind}_cat_combo", cat_combo)
         setattr(self, f"{kind}_stream_combo", stream_combo)
         setattr(self, f"{kind}_search_edit", search_edit)
         setattr(self, f"{kind}_list", list_w)
+        setattr(self, f"{kind}_count_label", count_label)
+        setattr(self, f"{kind}_search_timer", search_timer)
 
+        return widget
+
+    def _configure_media_rail(self, rail: QListWidget) -> None:
+        rail.setObjectName("MediaRail")
+        rail.setViewMode(QListWidget.IconMode)
+        rail.setFlow(QListWidget.LeftToRight)
+        rail.setWrapping(False)
+        rail.setMovement(QListWidget.Static)
+        rail.setResizeMode(QListWidget.Adjust)
+        rail.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        rail.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        rail.setIconSize(QSize(118, 166))
+        rail.setGridSize(QSize(154, 220))
+        rail.setFixedHeight(228)
+        rail.setSpacing(8)
+
+    def _open_hero_item(self) -> None:
+        featured = getattr(self, "hero_item", None)
+        if featured:
+            self._open_details_modal(featured)
+        else:
+            self._switch_tab(2)
+
+    def _create_search_view(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(30, 24, 30, 26)
+        layout.setSpacing(16)
+
+        kicker = QLabel("BUSCA GLOBAL")
+        kicker.setProperty("kicker", True)
+        self.search_title = QLabel("Resultados")
+        self.search_title.setProperty("heading", True)
+        self.search_summary = QLabel("Digite pelo menos dois caracteres para pesquisar.")
+        self.search_summary.setProperty("muted", True)
+        self.global_results = QTreeWidget()
+        self.global_results.setObjectName("SearchResults")
+        self.global_results.setHeaderLabels(["TIPO", "TÍTULO", "CATEGORIA", "FONTE"])
+        self.global_results.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.global_results.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.global_results.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.global_results.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.global_results.setRootIsDecorated(False)
+        self.global_results.setAlternatingRowColors(True)
+        self.global_results.itemDoubleClicked.connect(self._on_global_result_clicked)
+
+        layout.addWidget(kicker)
+        layout.addWidget(self.search_title)
+        layout.addWidget(self.search_summary)
+        layout.addSpacing(4)
+        layout.addWidget(self.global_results, 1)
         return widget
 
     def _create_offline_view(self) -> QWidget:
@@ -785,14 +886,14 @@ class MainWindow(QMainWindow):
         # 3. Parental Control & PIN
         parental_group = QGroupBox("CONTROLE PARENTAL & BLOQUEIO DE CATEGORIAS")
         parental_layout = QFormLayout(parental_group)
-        self.pin_edit = QLineEdit(self.config.parental_pin)
+        self.pin_edit = QLineEdit()
+        self.pin_edit.setPlaceholderText("Novo PIN")
+        self.pin_edit.setEchoMode(QLineEdit.Password)
         self.pin_edit.setMaxLength(8)
         self.pin_edit.setFixedWidth(100)
-        self.pin_edit.textChanged.connect(lambda t: setattr(self.config, "parental_pin", t))
-
         parental_layout.addRow("PIN de Segurança (4 dígitos):", self.pin_edit)
         btn_save_pin = QPushButton("Salvar Novo PIN")
-        btn_save_pin.clicked.connect(lambda: self.config_store.save(self.config))
+        btn_save_pin.clicked.connect(self._save_parental_pin)
         parental_layout.addRow("", btn_save_pin)
         c_layout.addWidget(parental_group)
 
@@ -807,6 +908,21 @@ class MainWindow(QMainWindow):
         backup_layout.addWidget(btn_import)
         backup_layout.addStretch()
         c_layout.addWidget(backup_group)
+
+        security_group = QGroupBox("SEGURANÇA // STATUS DE PRÉ-LANÇAMENTO")
+        security_layout = QVBoxLayout(security_group)
+        security_copy = QLabel(
+            "✓ Segredos no cofre do sistema\n"
+            "✓ Cache e histórico sem URLs autenticadas\n"
+            "✓ PIN derivado com PBKDF2\n"
+            "✓ Exclusões limitadas à pasta de downloads\n\n"
+            "Distribuição: assine o executável e publique checksums. Proteção absoluta contra cópia "
+            "não existe em aplicativos desktop; licenciamento deve ser validado por um serviço próprio."
+        )
+        security_copy.setWordWrap(True)
+        security_copy.setProperty("muted", True)
+        security_layout.addWidget(security_copy)
+        c_layout.addWidget(security_group)
 
         scroll.setWidget(content)
         layout.addWidget(scroll)
@@ -912,6 +1028,7 @@ class MainWindow(QMainWindow):
 
         items = self.catalog.get_items(kind, hidden_categories=hidden)
         self._fill_items_list(list_w, items)
+        self._update_catalog_count(kind, len(items), "")
 
     def _filter_catalog_view(
         self,
@@ -936,6 +1053,13 @@ class MainWindow(QMainWindow):
                 ]
 
         self._fill_items_list(list_w, items)
+        self._update_catalog_count(kind, len(items), query)
+
+    def _update_catalog_count(self, kind: str, count: int, query: str) -> None:
+        label = getattr(self, f"{kind}_count_label", None)
+        if label:
+            suffix = f' para “{query.strip()}”' if query.strip() else ""
+            label.setText(f"{count} título{'s' if count != 1 else ''}{suffix}")
 
     def _filter_series(self) -> None:
         """Compatibility method for tests."""
@@ -1053,11 +1177,69 @@ class MainWindow(QMainWindow):
 
     def _fill_items_list(self, list_w: QListWidget, items: list[MediaItem]) -> None:
         list_w.clear()
-        for it in items[:250]:
+        if not items:
+            empty = QListWidgetItem("Nenhum resultado\nTente outro termo ou remova um filtro.")
+            empty.setFlags(Qt.NoItemFlags)
+            empty.setTextAlignment(Qt.AlignCenter)
+            empty.setSizeHint(QSize(360, 120))
+            list_w.addItem(empty)
+            return
+        for index, it in enumerate(items[:250]):
             fav_star = "★ " if it.id in self.current_profile.favorites else ""
-            list_item = QListWidgetItem(f"{fav_star}{it.title}  [{it.category_name}]")
+            category = it.category_name or "Sem categoria"
+            meta = "AO VIVO" if it.kind == "live" else category
+            list_item = QListWidgetItem(self._placeholder_icon(it.kind), f"{fav_star}{it.title}\n{meta}")
+            list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            list_item.setSizeHint(QSize(176, 270))
+            list_item.setToolTip(f"{it.title}\n{category}\nDuplo clique para abrir")
             list_item.setData(Qt.UserRole, it)
             list_w.addItem(list_item)
+            # Keep catalog opening responsive; the first viewport and nearby rows get artwork.
+            if it.poster and index < 60:
+                self._request_poster(it.poster, list_item)
+
+    def _placeholder_icon(self, kind: str) -> QIcon:
+        cache_key = f"placeholder:{kind}"
+        if cache_key in self._poster_cache:
+            return self._poster_cache[cache_key]
+        pixmap = QPixmap(148, 208)
+        pixmap.fill(QColor("#101827"))
+        painter = QPainter(pixmap)
+        painter.setPen(QColor("#2b5cff"))
+        painter.setFont(QFont("Segoe UI", 34, QFont.Bold))
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "LIVE" if kind == "live" else ("FILM" if kind == "movie" else "TV"))
+        painter.end()
+        icon = QIcon(pixmap)
+        self._poster_cache[cache_key] = icon
+        return icon
+
+    def _request_poster(self, url: str, list_item: QListWidgetItem) -> None:
+        parsed_url = QUrl(url)
+        if parsed_url.scheme().lower() not in {"http", "https"}:
+            return
+        if url in self._poster_cache:
+            list_item.setIcon(self._poster_cache[url])
+            return
+        reply = self.poster_network.get(QNetworkRequest(parsed_url))
+        self._poster_replies.add(reply)
+        reply.finished.connect(lambda r=reply, item=list_item, poster_url=url: self._poster_ready(r, item, poster_url))
+
+    def _poster_ready(self, reply: QNetworkReply, list_item: QListWidgetItem, url: str) -> None:
+        self._poster_replies.discard(reply)
+        content_type = str(reply.header(QNetworkRequest.ContentTypeHeader) or "").lower()
+        safe_scheme = reply.url().scheme().lower() in {"http", "https"}
+        safe_size = 0 <= reply.size() <= 5 * 1024 * 1024
+        if reply.error() == QNetworkReply.NetworkError.NoError and safe_scheme and safe_size and content_type.startswith("image/"):
+            pixmap = QPixmap()
+            if pixmap.loadFromData(reply.readAll()):
+                fitted = pixmap.scaled(148, 208, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                icon = QIcon(fitted)
+                self._poster_cache[url] = icon
+                try:
+                    list_item.setIcon(icon)
+                except RuntimeError:
+                    pass
+        reply.deleteLater()
 
     def _populate_live_channels(self) -> None:
         hidden = self.config.global_hidden_categories + self.current_profile.hidden_categories
@@ -1147,7 +1329,7 @@ class MainWindow(QMainWindow):
             return {}
 
     def _on_details_play_requested(self, item: MediaItem, episode: Episode | None) -> None:
-        target_url = episode.stream_url if episode else item.stream_url
+        target_url = episode.stream_url if episode else self._stream_url_for_item(item)
         content_id = episode.id if episode else item.id
         prog_data = self.current_profile.progress.get(content_id, {})
         resume_pos = prog_data.get("position_ms", 0)
@@ -1160,7 +1342,10 @@ class MainWindow(QMainWindow):
         content_id: str = "",
         resume_pos: int = 0,
     ) -> None:
-        stream_url = url or item.stream_url
+        stream_url = url or self._stream_url_for_item(item)
+        if not stream_url:
+            QMessageBox.warning(self, "Fonte indisponível", "Sincronize novamente esta fonte para renovar o endereço de reprodução.")
+            return
         cid = content_id or item.id
         self.view_stack.setCurrentIndex(8)
 
@@ -1175,7 +1360,7 @@ class MainWindow(QMainWindow):
 
     def _on_live_channel_selected(self, channel: MediaItem) -> None:
         if self.last_live_channel:
-            self.player_widget.last_channel_id = self.last_live_channel.stream_url
+            self.player_widget.last_channel_id = self._stream_url_for_item(self.last_live_channel)
         self.last_live_channel = channel
 
         acc = self._get_account_by_id(channel.account_id)
@@ -1247,6 +1432,17 @@ class MainWindow(QMainWindow):
         self._refresh_home_view()
 
     def _refresh_home_view(self) -> None:
+        featured = next((item for item in self.catalog.items.values() if item.kind in {"movie", "series"}), None)
+        self.hero_item = featured
+        if featured:
+            self.hero_title.setText(featured.title.upper())
+            self.hero_desc.setText(featured.synopsis or f"{featured.category_name} · disponível na sua biblioteca")
+            self.btn_hero_action.setText("Ver detalhes  →")
+        else:
+            self.hero_title.setText("STREAMING\nSEM RUÍDO")
+            self.hero_desc.setText("Conecte uma fonte para transformar sua programação em uma biblioteca visual.")
+            self.btn_hero_action.setText("Explorar filmes  →")
+
         self.continue_watching_list.clear()
         for cid, prog in sorted(self.current_profile.progress.items(), key=lambda x: x[1].get("updated_at", 0), reverse=True)[:10]:
             item = self.catalog.items.get(cid)
@@ -1254,25 +1450,41 @@ class MainWindow(QMainWindow):
                 pos = prog.get("position_ms", 0)
                 dur = prog.get("duration_ms", 1)
                 pct = int((pos / dur) * 100) if dur > 0 else 0
-                list_item = QListWidgetItem(f"▶ {item.title}  [{pct}% assistido]")
-                list_item.setData(Qt.UserRole, cid)
-                self.continue_watching_list.addItem(list_item)
+                self._add_media_rail_item(self.continue_watching_list, item, f"{pct}% assistido", cid)
+        self._ensure_rail_state(self.continue_watching_list, "Nada em andamento")
 
         self.home_favs_list.clear()
         for fid in self.current_profile.favorites[:15]:
             item = self.catalog.items.get(fid)
             if item:
-                li = QListWidgetItem(f"★ {item.title} ({item.category_name})")
-                li.setData(Qt.UserRole, item)
-                self.home_favs_list.addItem(li)
+                self._add_media_rail_item(self.home_favs_list, item, item.category_name, item)
+        self._ensure_rail_state(self.home_favs_list, "Favorite títulos para encontrá-los aqui")
 
         self.home_watchlist_list.clear()
         for wid in self.current_profile.watchlist[:15]:
             item = self.catalog.items.get(wid)
             if item:
-                li = QListWidgetItem(f"✓ {item.title} ({item.category_name})")
-                li.setData(Qt.UserRole, item)
-                self.home_watchlist_list.addItem(li)
+                self._add_media_rail_item(self.home_watchlist_list, item, item.category_name, item)
+        self._ensure_rail_state(self.home_watchlist_list, "Sua lista está vazia")
+
+    def _add_media_rail_item(self, rail: QListWidget, media: MediaItem, meta: str, payload: Any) -> None:
+        card = QListWidgetItem(self._placeholder_icon(media.kind), f"{media.title}\n{meta}")
+        card.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        card.setSizeHint(QSize(146, 212))
+        card.setData(Qt.UserRole, payload)
+        card.setToolTip(media.title)
+        rail.addItem(card)
+        if media.poster:
+            self._request_poster(media.poster, card)
+
+    def _ensure_rail_state(self, rail: QListWidget, message: str) -> None:
+        if rail.count():
+            return
+        empty = QListWidgetItem(message)
+        empty.setFlags(Qt.NoItemFlags)
+        empty.setTextAlignment(Qt.AlignCenter)
+        empty.setSizeHint(QSize(300, 180))
+        rail.addItem(empty)
 
     def _refresh_lists_view(self) -> None:
         self.favs_list.clear()
@@ -1304,7 +1516,10 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------
 
     def _on_details_download_requested(self, item: MediaItem, episode: Episode | None) -> None:
-        target_url = episode.stream_url if episode else item.stream_url
+        target_url = episode.stream_url if episode else self._stream_url_for_item(item)
+        if not target_url:
+            QMessageBox.warning(self, "Fonte indisponível", "Sincronize novamente esta fonte antes de baixar.")
+            return
         title = f"{item.title} - S{episode.season_num:02d}E{episode.episode_num:02d}" if episode else item.title
         dest_dir = self.config.download_dir or str(default_download_dir())
         base_name = safe_filename(title)
@@ -1333,6 +1548,15 @@ class MainWindow(QMainWindow):
                 extension=ep.container_extension,
             )
         QMessageBox.information(self, "Temporada Enfileirada", f"{len(episodes)} episódios da Temporada {season_num} foram adicionados à fila de downloads!")
+
+    def _stream_url_for_item(self, item: MediaItem) -> str:
+        if item.stream_url:
+            return item.stream_url
+        account = self._get_account_by_id(item.account_id)
+        if not account or account.account_type != "xtream":
+            return ""
+        client = XtreamClient(account.server_url, account.username, account.password)
+        return client.stream_urls(item.kind, item.stream_id, item.container_extension)[0]
 
     def _on_task_updated(self, task: DownloadTask) -> None:
         self.download_banner.update_task(task)
@@ -1433,6 +1657,11 @@ class MainWindow(QMainWindow):
         if folder:
             self.config.download_dir = folder
             self.config_store.save(self.config)
+            self.download_manager.configure(
+                self.config.max_concurrent_downloads,
+                self.config.use_ffmpeg_fallback,
+                folder,
+            )
 
     def _open_download_folder(self) -> None:
         folder = self.config.download_dir or str(default_download_dir())
@@ -1446,13 +1675,67 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------
 
     def _on_search_query_changed(self, query: str) -> None:
-        if not query.strip():
+        clean_query = query.strip()
+        if not clean_query:
+            self._global_search_timer.stop()
+            self.global_results.clear()
+            if self.view_stack.currentIndex() == 9:
+                self._switch_tab(self._search_origin_index)
+            return
+        if len(normalize_text(clean_query)) < 2:
             return
         current_idx = self.view_stack.currentIndex()
-        if current_idx == 2 and hasattr(self, "movie_cat_combo"):
-            self._filter_catalog_view("movie", self.movie_cat_combo, self.search_input, self.movie_list)
-        elif current_idx == 3 and hasattr(self, "series_cat_combo"):
-            self._filter_catalog_view("series", self.series_cat_combo, self.search_input, self.series_list)
+        if current_idx != 9 and current_idx < 8:
+            self._search_origin_index = current_idx
+        self._global_search_timer.start()
+
+    def _execute_global_search(self) -> None:
+        query = self.search_input.text().strip()
+        if len(normalize_text(query)) < 2:
+            return
+        hidden = self.config.global_hidden_categories + self.current_profile.hidden_categories
+        locked = self.config.locked_categories
+        account_id = self.account_combo.currentData() or "all"
+        grouped = self.catalog.global_search(
+            query,
+            hidden_categories=hidden,
+            locked_categories=locked,
+            account_id=account_id,
+        )
+        type_names = {"live": "AO VIVO", "movie": "FILME", "series": "SÉRIE"}
+        account_names = {
+            account.get("id"): account.get("name", "Fonte")
+            for account in self.config.accounts
+        }
+        self.global_results.clear()
+        total = 0
+        for kind in ("movie", "series", "live"):
+            for media in grouped[kind]:
+                row = QTreeWidgetItem([
+                    type_names[kind],
+                    media.title,
+                    media.category_name or "Sem categoria",
+                    account_names.get(media.account_id, "Fonte local"),
+                ])
+                row.setData(0, Qt.UserRole, media)
+                self.global_results.addTopLevelItem(row)
+                total += 1
+        self.search_title.setText(f'Resultados para “{query}”')
+        if total:
+            counts = [
+                f"{len(grouped[kind])} {label}"
+                for kind, label in (("movie", "filmes"), ("series", "séries"), ("live", "canais"))
+                if grouped[kind]
+            ]
+            self.search_summary.setText(f"{total} resultados · " + " · ".join(counts))
+        else:
+            self.search_summary.setText("Nenhum resultado. Tente menos palavras ou confira a fonte selecionada.")
+        self._switch_tab(9)
+
+    def _on_global_result_clicked(self, tree_item: QTreeWidgetItem, _column: int) -> None:
+        media: MediaItem | None = tree_item.data(0, Qt.UserRole)
+        if media:
+            self._open_details_modal(media)
 
     # -------------------------------------------------------------
     # Multi-Account & Profiles & Security
@@ -1502,10 +1785,20 @@ class MainWindow(QMainWindow):
         return any(normalize_text(locked) in norm for locked in self.config.locked_categories)
 
     def _prompt_pin(self) -> bool:
-        dialog = PinDialog(expected_pin=self.config.parental_pin, parent=self)
+        dialog = PinDialog(parent=self, verifier=lambda candidate: self.config_store.verify_pin(self.config, candidate))
         if dialog.exec() == QDialog.Accepted:
             return True
         return False
+
+    def _save_parental_pin(self) -> None:
+        pin = self.pin_edit.text()
+        if not pin.isdigit() or not 4 <= len(pin) <= 8:
+            QMessageBox.warning(self, "PIN inválido", "Use de 4 a 8 dígitos.")
+            return
+        self.config.parental_pin = pin
+        self.config_store.save(self.config)
+        self.pin_edit.clear()
+        QMessageBox.information(self, "PIN protegido", "O PIN foi salvo de forma derivada, sem texto puro.")
 
     def _show_add_xtream_dialog(self) -> None:
         dialog = QDialog(self)
@@ -1532,12 +1825,20 @@ class MainWindow(QMainWindow):
 
     def _save_xtream_account(self, dialog: QDialog, name: str, url: str, user: str, password: str) -> None:
         import uuid
+        if not all((name.strip(), url.strip(), user.strip(), password)):
+            QMessageBox.warning(dialog, "Dados incompletos", "Preencha nome, servidor, usuário e senha.")
+            return
+        try:
+            validated_client = XtreamClient(url, user, password)
+        except Exception as exc:
+            QMessageBox.warning(dialog, "Servidor inválido", str(exc))
+            return
         acc = Account(
             id=str(uuid.uuid4()),
-            name=name,
+            name=name.strip()[:80],
             account_type="xtream",
-            server_url=url,
-            username=user,
+            server_url=validated_client.server_url,
+            username=user.strip(),
             password=password,
         )
         self.config.accounts.append(acc.to_dict())
@@ -1570,11 +1871,20 @@ class MainWindow(QMainWindow):
 
     def _save_m3u_account(self, dialog: QDialog, name: str, m3u_url: str) -> None:
         import uuid
+        source = m3u_url.strip()
+        is_remote = len(source) <= 4096 and source.startswith(("http://", "https://"))
+        try:
+            is_local = bool(source) and len(source) <= 1024 and Path(source).is_file()
+        except OSError:
+            is_local = False
+        if not name.strip() or not (is_remote or is_local):
+            QMessageBox.warning(dialog, "Lista inválida", "Use uma URL HTTP/HTTPS ou selecione um arquivo M3U local existente.")
+            return
         acc = Account(
             id=str(uuid.uuid4()),
-            name=name,
+            name=name.strip()[:80],
             account_type="m3u",
-            m3u_url=m3u_url,
+            m3u_url=source,
         )
         self.config.accounts.append(acc.to_dict())
         self.config_store.save(self.config)
@@ -1587,6 +1897,7 @@ class MainWindow(QMainWindow):
         if curr_id == "all":
             return
         self.config.accounts = [a for a in self.config.accounts if a.get("id") != curr_id]
+        self.config_store.delete_account_secrets(str(curr_id))
         self.config_store.save(self.config)
         self._reload_accounts_combo()
         self.sync_active_account()

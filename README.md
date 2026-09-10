@@ -14,6 +14,7 @@ Happitv adota a estética brutalista, laboratorial e de alto desempenho da **Blu
 - Tipografia suíça com kickers e indicadores monoespaçados (`DM Mono` / `Consolas`).
 - Ponto de status pulsante (`● Live Dot`) para streams e diagnóstico de latência de servidor.
 - Layouts de alta densidade e cartões com bordas técnicas (`1px solid #1c2230`).
+- Home editorial com hero de tipografia ampla, trilhos horizontais de conteúdo e catálogos em grid com capas carregadas sob demanda.
 
 ---
 
@@ -77,8 +78,17 @@ Happitv adota a estética brutalista, laboratorial e de alto desempenho da **Blu
 
 ### 9. Privacidade Local-First & Backup
 - Credenciais e histórico permanecem exclusivamente na máquina local.
+- Senhas Xtream, URLs M3U privadas e endereços autenticados de downloads ficam no cofre de credenciais do sistema e não no JSON/cache.
 - **Exportar Backup JSON**: Salva contas, perfis, listas e configurações (sem senhas por padrão).
 - **Importar Backup JSON**: Restauração com 1 clique.
+
+### 10. Segurança de distribuição
+
+- CI executa testes, análise estática com Bandit e auditoria de dependências com `pip-audit`.
+- Dependabot acompanha dependências Python e GitHub Actions.
+- Cache não grava URLs que contenham credenciais; mensagens de erro sensíveis são redigidas.
+- Exclusão de arquivos é limitada à pasta de downloads configurada.
+- Consulte [SECURITY.md](SECURITY.md) antes de publicar uma release. Assinatura do executável e proteção de branch ainda precisam ser configuradas pelo mantenedor.
 
 ---
 

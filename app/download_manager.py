@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import keyring
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from app.models import DownloadStatus, DownloadTask, safe_filename
@@ -23,6 +24,12 @@ CONTENT_EXTENSIONS = {
     "video/mp4": "mp4", "video/x-matroska": "mkv", "video/webm": "webm",
     "video/mp2t": "ts", "video/mpeg": "mpeg", "application/octet-stream": None,
 }
+DOWNLOAD_SECRET_SERVICE = "Happitv.Downloads"
+
+
+def safe_error_message(error: Exception) -> str:
+    message = re.sub(r"https?://\S+", "[URL protegida]", str(error))
+    return message[:300] or "Falha inesperada no download."
 
 
 class WorkerSignals(QObject):
@@ -80,7 +87,7 @@ class DownloadWorker(QRunnable):
                     self.signals.cancelled.emit(self.task.id)
                     return
                 except Exception as exc:
-                    last_error = str(exc)
+                    last_error = safe_error_message(exc)
 
             if self.use_ffmpeg and shutil.which("ffmpeg") and not self._cancel.is_set():
                 try:
@@ -91,7 +98,7 @@ class DownloadWorker(QRunnable):
                     self.signals.cancelled.emit(self.task.id)
                     return
                 except Exception as exc:
-                    last_error = str(exc)
+                    last_error = safe_error_message(exc)
 
             self.task.retry_count += 1
             if self.task.retry_count <= self.task.max_retries and not self._cancel.is_set():
@@ -170,7 +177,7 @@ class DownloadManager(QObject):
     task_updated = Signal(object)
     task_removed = Signal(str)
 
-    def __init__(self, history_path: Path | None = None, max_concurrent: int = 2) -> None:
+    def __init__(self, history_path: Path | None = None, max_concurrent: int = 2, download_root: Path | None = None) -> None:
         super().__init__()
         self.history_path = history_path or app_data_dir() / "history.json"
         self.pool = QThreadPool(self)
@@ -179,11 +186,14 @@ class DownloadManager(QObject):
         self._pending: deque[str] = deque()
         self._workers: dict[str, DownloadWorker] = {}
         self.use_ffmpeg_fallback = True
+        self.download_root = (download_root or Path.home() / "Downloads" / "Happiptv").resolve()
         self._load()
 
-    def configure(self, max_concurrent: int, use_ffmpeg: bool) -> None:
+    def configure(self, max_concurrent: int, use_ffmpeg: bool, download_root: str | Path | None = None) -> None:
         self.pool.setMaxThreadCount(max(1, min(max_concurrent, 6)))
         self.use_ffmpeg_fallback = use_ffmpeg
+        if download_root:
+            self.download_root = Path(download_root).resolve()
 
     def add(self, **kwargs: Any) -> DownloadTask:
         task_id = kwargs.pop("id", str(uuid.uuid4()))
@@ -238,18 +248,29 @@ class DownloadManager(QObject):
         task = self.tasks.pop(task_id, None)
         if task:
             try:
-                if task.output_path and Path(task.output_path).exists():
+                if task.output_path and self._is_safe_download_path(Path(task.output_path)):
                     Path(task.output_path).unlink(missing_ok=True)
                 dest = task.destination
-                if dest.exists():
+                if self._is_safe_download_path(dest) and dest.exists():
                     dest.unlink(missing_ok=True)
-                part = dest.with_suffix(".part")
-                if part.exists():
+                part = Path(task.destination_dir) / f"{task.base_filename}.part"
+                if self._is_safe_download_path(part) and part.exists():
                     part.unlink(missing_ok=True)
             except Exception:
                 pass
+            try:
+                keyring.delete_password(DOWNLOAD_SECRET_SERVICE, task_id)
+            except Exception:  # Keyring backends may raise platform-specific errors.
+                pass
             self.task_removed.emit(task_id)
             self._save()
+
+    def _is_safe_download_path(self, candidate: Path) -> bool:
+        try:
+            candidate.resolve().relative_to(self.download_root)
+            return True
+        except (OSError, ValueError):
+            return False
 
     def get_completed_tasks(self) -> list[DownloadTask]:
         """Returns completed tasks whose files exist on disk for the Offline Library"""
@@ -320,13 +341,33 @@ class DownloadManager(QObject):
         try:
             for raw in json.loads(self.history_path.read_text(encoding="utf-8")):
                 task = DownloadTask.from_dict(raw)
+                if not task.url_candidates and task.status != DownloadStatus.COMPLETED:
+                    try:
+                        stored = keyring.get_password(DOWNLOAD_SECRET_SERVICE, task.id)
+                        task.url_candidates = json.loads(stored) if stored else []
+                    except Exception:  # Invalid vault data or unavailable backend.
+                        task.url_candidates = []
                 self.tasks[task.id] = task
         except (OSError, ValueError, TypeError):
             self.tasks = {}
 
     def _save(self) -> None:
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
-        data = [task.to_dict() for task in self.tasks.values()]
+        data = []
+        for task in self.tasks.values():
+            if task.url_candidates and task.status != DownloadStatus.COMPLETED:
+                try:
+                    keyring.set_password(DOWNLOAD_SECRET_SERVICE, task.id, json.dumps(task.url_candidates))
+                except Exception:  # Keyring backends may raise platform-specific errors.
+                    pass
+            elif task.status == DownloadStatus.COMPLETED:
+                try:
+                    keyring.delete_password(DOWNLOAD_SECRET_SERVICE, task.id)
+                except Exception:  # Keyring backends may raise platform-specific errors.
+                    pass
+            raw = task.to_dict()
+            raw["url_candidates"] = []
+            data.append(raw)
         temp = self.history_path.with_suffix(".tmp")
         temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(self.history_path)
