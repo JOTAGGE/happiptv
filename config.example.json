@@ -1,0 +1,8 @@
+{
+  "server_url": "https://seu-servidor.example",
+  "username": "seu_usuario",
+  "download_dir": "C:\\Users\\SeuNome\\Downloads\\IPTV Offline Fetcher",
+  "use_ffmpeg_fallback": true,
+  "max_concurrent_downloads": 2
+}
+

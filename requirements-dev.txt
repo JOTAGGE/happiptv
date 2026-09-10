@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8.2,<9
+pytest-qt>=4.4,<5
+responses>=0.25,<1
+pyinstaller>=6.10,<7
+
